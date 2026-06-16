@@ -66,6 +66,7 @@ func CrawlAndDiscover(cfg *config.Config, seedURL string) ([]EntryPoint, error) 
 
 		resp, err := client.Do(req)
 		if err != nil {
+			log.Printf("[CRAWL] ✗ Failed to fetch %s: %v", u, err)
 			return
 		}
 		defer resp.Body.Close()
