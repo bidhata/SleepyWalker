@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "sleepywalker": {
+      "command": "sleepywalker-mcp",
+      "args": [],
+      "env": {}
+    }
+  }
+}

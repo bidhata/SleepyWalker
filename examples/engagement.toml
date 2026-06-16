@@ -1,0 +1,73 @@
+# SleepyWalker Configuration File
+# Use with: sleepywalker -url https://target.internal -config engagement.toml
+# CLI flags override values in this file.
+
+[target]
+url = "https://target.internal"
+
+[scope]
+regex = ".*\\.internal$"
+cidrs = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+
+[scan]
+depth       = 2
+threads     = 8
+delay_ms    = 100
+max_requests = 10000
+dry_run     = false
+js_render   = false
+swagger_url = ""
+insecure    = false
+
+[auth]
+cookie  = "session=abc123; csrf_token=xyz"
+headers = ["Authorization: Bearer <token>", "X-Custom-Header: value"]
+proxy   = ""
+
+[ai]
+provider = "openrouter"
+# API key is NEVER stored here — always prompted at runtime
+
+[sqlmap]
+path  = ""
+risk  = 2
+level = 3
+
+[output]
+format = "all"  # html, json, sarif, or all
+
+[audit]
+operator      = "jsmith"
+engagement_id = "PT-2024-042"
+log_dir       = "./logs"
+
+# Hook scripts directory (auto-registers by filename convention)
+hooks_dir = "./hooks"
+
+# Inline hook definitions
+# Hooks execute shell commands at specific scan lifecycle phases.
+# Available phases: pre-scan, post-discovery, post-confirm, post-exploit, post-report
+#
+# Hook context is passed as JSON on stdin with fields:
+#   phase, target_url, operator, engagement_id, timestamp, data
+
+[[hooks]]
+name    = "notify-slack"
+phase   = "post-report"
+command = "python3"
+args    = "scripts/notify_slack.py {{.TargetURL}} {{.Operator}}"
+timeout = 15
+
+[[hooks]]
+name    = "upload-s3"
+phase   = "post-report"
+command = "aws"
+args    = "s3 cp ./dumps/ s3://security-reports/{{.EngagementID}}/ --recursive"
+timeout = 60
+
+[[hooks]]
+name    = "validate-scope"
+phase   = "pre-scan"
+command = "python3"
+args    = "scripts/validate_engagement.py {{.EngagementID}}"
+timeout = 10
