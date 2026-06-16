@@ -94,23 +94,25 @@ func executeHook(h Hook, ctx HookContext) error {
 		timeout = 30
 	}
 
-	// Template substitution in args
+	// Template substitution in args only — never split h.Command with strings.Fields
+	// to avoid breaking paths that contain spaces.
 	args := h.Args
 	args = strings.ReplaceAll(args, "{{.TargetURL}}", ctx.TargetURL)
 	args = strings.ReplaceAll(args, "{{.Operator}}", ctx.Operator)
 	args = strings.ReplaceAll(args, "{{.EngagementID}}", ctx.EngagementID)
 	args = strings.ReplaceAll(args, "{{.Phase}}", string(ctx.Phase))
 
-	// Build command
-	cmdParts := strings.Fields(h.Command)
-	if args != "" {
-		cmdParts = append(cmdParts, strings.Fields(args)...)
-	}
-	if len(cmdParts) == 0 {
+	if h.Command == "" {
 		return fmt.Errorf("empty command")
 	}
 
-	cmd := exec.Command(cmdParts[0], cmdParts[1:]...)
+	// Build argv: command is always a single token; args are split.
+	argv := []string{h.Command}
+	if args != "" {
+		argv = append(argv, strings.Fields(args)...)
+	}
+
+	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 

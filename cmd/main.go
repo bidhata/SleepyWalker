@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	"sleepywalker/internal/ai"
 	"sleepywalker/internal/config"
 	"sleepywalker/internal/hooks"
+	"sleepywalker/internal/learningdb"
 	"sleepywalker/internal/reporter"
 	"sleepywalker/internal/scanner"
 	"sleepywalker/internal/sqlmap"
@@ -47,7 +49,7 @@ func main() {
 		proxyURL     string
 		headers      []string
 		threads      = 4
-		crawlDepth   = 2
+		crawlDepth   = 0
 		rateDelayMs  = 0
 		maxRequests  = 0
 		dryRun       = false
@@ -65,63 +67,76 @@ func main() {
 		insecure     = false
 		configFile   string
 		hooksDir     string
+		ldbPath      string
 		ov           config.CLIOverrides // tracks which flags were explicitly set
 	)
 
 	for i := 1; i < len(os.Args); i++ {
-		switch os.Args[i] {
-		case "-url":
+		arg := os.Args[i]
+		// Support both "-flag value" and "-flag=value" forms.
+		var key, val string
+		var hasVal bool
+		if idx := strings.IndexByte(arg, '='); idx >= 0 {
+			key = arg[:idx]
+			val = arg[idx+1:]
+			hasVal = true
+		} else {
+			key = arg
+		}
+		nextArg := func() (string, bool) {
+			if hasVal {
+				return val, true
+			}
 			if i+1 < len(os.Args) {
-				targetURL = os.Args[i+1]
 				i++
+				return os.Args[i], true
+			}
+			return "", false
+		}
+		switch key {
+		case "-url":
+			if v, ok := nextArg(); ok {
+				targetURL = v
 			}
 		case "-threads":
-			if i+1 < len(os.Args) {
-				fmt.Sscanf(os.Args[i+1], "%d", &threads)
+			if v, ok := nextArg(); ok {
+				fmt.Sscanf(v, "%d", &threads)
 				ov.Threads = true
-				i++
 			}
 		case "-sqlmap-path":
-			if i+1 < len(os.Args) {
-				sqlmapPath = os.Args[i+1]
+			if v, ok := nextArg(); ok {
+				sqlmapPath = v
 				ov.SQLMapPath = true
-				i++
 			}
 		case "-cookie":
-			if i+1 < len(os.Args) {
-				cookies = os.Args[i+1]
+			if v, ok := nextArg(); ok {
+				cookies = v
 				ov.Cookie = true
-				i++
 			}
 		case "-header":
-			if i+1 < len(os.Args) {
-				headers = append(headers, os.Args[i+1])
+			if v, ok := nextArg(); ok {
+				headers = append(headers, v)
 				ov.Headers = true
-				i++
 			}
 		case "-proxy":
-			if i+1 < len(os.Args) {
-				proxyURL = os.Args[i+1]
+			if v, ok := nextArg(); ok {
+				proxyURL = v
 				ov.Proxy = true
-				i++
 			}
 		case "-depth":
-			if i+1 < len(os.Args) {
-				fmt.Sscanf(os.Args[i+1], "%d", &crawlDepth)
+			if v, ok := nextArg(); ok {
+				fmt.Sscanf(v, "%d", &crawlDepth)
 				ov.Depth = true
-				i++
 			}
 		case "-delay":
-			if i+1 < len(os.Args) {
-				fmt.Sscanf(os.Args[i+1], "%d", &rateDelayMs)
+			if v, ok := nextArg(); ok {
+				fmt.Sscanf(v, "%d", &rateDelayMs)
 				ov.Delay = true
-				i++
 			}
 		case "-max-requests":
-			if i+1 < len(os.Args) {
-				fmt.Sscanf(os.Args[i+1], "%d", &maxRequests)
+			if v, ok := nextArg(); ok {
+				fmt.Sscanf(v, "%d", &maxRequests)
 				ov.MaxRequests = true
-				i++
 			}
 		case "-dry-run":
 			dryRun = true
@@ -130,77 +145,69 @@ func main() {
 			insecure = true
 			ov.Insecure = true
 		case "-output-format":
-			if i+1 < len(os.Args) {
-				outputFormat = os.Args[i+1]
+			if v, ok := nextArg(); ok {
+				outputFormat = v
 				ov.OutputFormat = true
-				i++
 			}
 		case "-scope":
-			if i+1 < len(os.Args) {
-				scopeRegex = os.Args[i+1]
+			if v, ok := nextArg(); ok {
+				scopeRegex = v
 				ov.Scope = true
-				i++
 			}
 		case "-scope-cidr":
-			if i+1 < len(os.Args) {
-				scopeCIDRs = append(scopeCIDRs, os.Args[i+1])
+			if v, ok := nextArg(); ok {
+				scopeCIDRs = append(scopeCIDRs, v)
 				ov.ScopeCIDRs = true
-				i++
 			}
 		case "-operator":
-			if i+1 < len(os.Args) {
-				operator = os.Args[i+1]
+			if v, ok := nextArg(); ok {
+				operator = v
 				ov.Operator = true
-				i++
 			}
 		case "-engagement-id":
-			if i+1 < len(os.Args) {
-				engagementID = os.Args[i+1]
+			if v, ok := nextArg(); ok {
+				engagementID = v
 				ov.EngagementID = true
-				i++
 			}
 		case "-log-dir":
-			if i+1 < len(os.Args) {
-				logDir = os.Args[i+1]
+			if v, ok := nextArg(); ok {
+				logDir = v
 				ov.LogDir = true
-				i++
 			}
 		case "-risk":
-			if i+1 < len(os.Args) {
-				fmt.Sscanf(os.Args[i+1], "%d", &sqlmapRisk)
+			if v, ok := nextArg(); ok {
+				fmt.Sscanf(v, "%d", &sqlmapRisk)
 				ov.Risk = true
-				i++
 			}
 		case "-level":
-			if i+1 < len(os.Args) {
-				fmt.Sscanf(os.Args[i+1], "%d", &sqlmapLevel)
+			if v, ok := nextArg(); ok {
+				fmt.Sscanf(v, "%d", &sqlmapLevel)
 				ov.Level = true
-				i++
 			}
 		case "-ai-provider":
-			if i+1 < len(os.Args) {
-				aiProvider = os.Args[i+1]
+			if v, ok := nextArg(); ok {
+				aiProvider = v
 				ov.AIProvider = true
-				i++
 			}
 		case "-swagger-url":
-			if i+1 < len(os.Args) {
-				swaggerURL = os.Args[i+1]
+			if v, ok := nextArg(); ok {
+				swaggerURL = v
 				ov.SwaggerURL = true
-				i++
 			}
 		case "-js-render":
 			jsRender = true
 			ov.JSRender = true
 		case "-config":
-			if i+1 < len(os.Args) {
-				configFile = os.Args[i+1]
-				i++
+			if v, ok := nextArg(); ok {
+				configFile = v
 			}
 		case "-hooks-dir":
-			if i+1 < len(os.Args) {
-				hooksDir = os.Args[i+1]
-				i++
+			if v, ok := nextArg(); ok {
+				hooksDir = v
+			}
+		case "-ldb-path":
+			if v, ok := nextArg(); ok {
+				ldbPath = v
 			}
 		case "-help", "--help", "-h":
 			printUsage()
@@ -239,13 +246,10 @@ func main() {
 	}
 
 	apiKey := ""
-	offlineMode := true
-	tmpCfg := &config.Config{AIProvider: effectiveProvider}
-	if tmpCfg.NeedsAPIKey() {
+	offlineMode := !(&config.Config{AIProvider: effectiveProvider}).NeedsAPIKey()
+	if !offlineMode {
 		apiKey = config.PromptAPIKey()
 		offlineMode = apiKey == ""
-	} else {
-		offlineMode = false // local/bedrock doesn't need offline fallback
 	}
 	if offlineMode {
 		fmt.Println("⚡ Offline mode: using deep local validation instead of AI.")
@@ -297,6 +301,15 @@ func main() {
 	utils.InitLogger()
 	utils.InitAuditLogger(logDir, operator, engagementID, targetURL)
 
+	// Load learning DB — enriches signatures and payloads from prior scans.
+	ldb := learningdb.Load(ldbPath)
+	defer func() {
+		if err := ldb.Save(); err != nil {
+			log.Printf("[WARN] Learning DB save failed: %v", err)
+		}
+	}()
+	log.Printf("[LEARNINGDB] Stats: %s", ldb.Stats())
+
 	// Graceful shutdown: flush audit log on interrupt
 	ctx, cancel := context.WithCancel(context.Background())
 	sigCh := make(chan os.Signal, 1)
@@ -306,6 +319,9 @@ func main() {
 		log.Println("\n[INFO] Interrupt received — shutting down gracefully…")
 		utils.AuditLog(utils.AuditEntry{Action: "interrupted", Detail: "operator signal"})
 		utils.CloseAuditLogger()
+		if err := ldb.Save(); err != nil {
+			log.Printf("[WARN] Learning DB save failed on interrupt: %v", err)
+		}
 		cancel()
 		os.Exit(130)
 	}()
@@ -347,6 +363,10 @@ func main() {
 			URL:    targetURL,
 			Detail: wafResult.WAFName,
 		})
+		// Record WAF in learning DB for future scans.
+		if ldb != nil {
+			ldb.RecordWAF(extractURLHost(targetURL), wafResult.WAFName, "", "", wafResult.Fingerprint)
+		}
 	}
 
 	// ══════════════════════════════════════════════════════════════════
@@ -418,10 +438,9 @@ func main() {
 	}
 	var confirmed []confirmedEntry
 
+	log.Println("═══════════════════════════════════════════════════════")
 	if offlineMode {
-		log.Println("═══════════════════════════════════════════════════════")
 		log.Printf("  PHASE 2 ▸ Deep local validation on %d suspicious endpoint(s)", len(suspicious))
-		log.Println("═══════════════════════════════════════════════════════")
 
 		deepResults := scanner.DeepValidate(suspicious)
 		for i, dr := range deepResults {
@@ -435,9 +454,7 @@ func main() {
 			}
 		}
 	} else {
-		log.Println("═══════════════════════════════════════════════════════")
 		log.Printf("  PHASE 2 ▸ AI analysis on %d suspicious endpoint(s)", len(suspicious))
-		log.Println("═══════════════════════════════════════════════════════")
 
 		for _, hr := range suspicious {
 			vulnerable, suggestion, err := ai.AnalyzeEndpoint(*cfg, hr.Entry)
@@ -453,14 +470,71 @@ func main() {
 					confidence: 0.85,
 					method:     "AI",
 				})
-			} else {
-				log.Printf("[AI] ✗ Not confirmed: %s", hr.Entry.URL)
+				continue
 			}
+			log.Printf("[AI] ✗ Not confirmed: %s", hr.Entry.URL)
 		}
 	}
+	log.Println("═══════════════════════════════════════════════════════")
 
 	log.Printf("[PHASE 2 COMPLETE] Confirmed %d / %d suspicious endpoint(s)",
 		len(confirmed), len(suspicious))
+
+	// Record Phase 2 outcomes in the learning DB.
+	if ldb != nil {
+		host := extractURLHost(targetURL)
+		// Record confirmed injections.
+		for _, c := range confirmed {
+			// Extract DB engine from matched error strings regardless of confirmation method.
+			dbEngine := ""
+			for _, e := range c.hr.MatchedErrors {
+				el := strings.ToLower(e)
+				switch {
+				case strings.Contains(el, "mysql") || strings.Contains(el, "mariadb"):
+					dbEngine = "MySQL"
+				case strings.Contains(el, "postgresql") || strings.Contains(el, "pg_"):
+					dbEngine = "PostgreSQL"
+				case strings.Contains(el, "mssql") || strings.Contains(el, "microsoft"):
+					dbEngine = "MSSQL"
+				case strings.Contains(el, "oracle") || strings.Contains(el, "ora-"):
+					dbEngine = "Oracle"
+				case strings.Contains(el, "sqlite"):
+					dbEngine = "SQLite"
+				}
+				if dbEngine != "" {
+					break
+				}
+			}
+			param := pickMainParam(c.hr.Entry)
+			ldb.RecordConfirmedInjection(host, c.hr.Entry.URL, param,
+				c.hr.Entry.InjectionLoc, c.suggestion, dbEngine, c.confidence, nil)
+			if c.suggestion != "" {
+				ldb.RecordPayloadAttempt(c.suggestion, c.hr.Entry.InjectionLoc, dbEngine, true)
+			}
+		}
+		// Record false positives: suspicious but unconfirmed.
+		for _, hr := range suspicious {
+			wasConfirmed := false
+			for _, c := range confirmed {
+				if c.hr.Entry.URL == hr.Entry.URL && c.hr.Entry.InjectionLoc == hr.Entry.InjectionLoc {
+					wasConfirmed = true
+					break
+				}
+			}
+			if !wasConfirmed {
+				// Derive a meaningful FP type category rather than storing the raw payload string,
+				// so IsFalsePositive lookups can match by category.
+				fpType := "error-based"
+				switch hr.TestPayload {
+				case "boolean-differential":
+					fpType = "boolean-diff"
+				case "time-based":
+					fpType = "time-based"
+				}
+				ldb.RecordFalsePositive(host, pickMainParam(hr.Entry), fpType)
+			}
+		}
+	}
 
 	if len(confirmed) == 0 {
 		log.Println("[INFO] No vulnerabilities confirmed. Generating report.")
@@ -701,6 +775,29 @@ func writeReports(cfg *config.Config, targetURL string, results []reporter.ScanR
 		EngagementID: cfg.EngagementID,
 		Data:         map[string]interface{}{"reports": paths, "output_dir": outputDir},
 	})
+}
+
+// extractURLHost returns the hostname from a URL string.
+func extractURLHost(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Host == "" {
+		return rawURL
+	}
+	return u.Hostname()
+}
+
+// pickMainParam returns the most likely injectable parameter name from an EntryPoint.
+func pickMainParam(ep scanner.EntryPoint) string {
+	priority := []string{"id", "uid", "user", "username", "search", "query", "q", "page"}
+	for _, p := range priority {
+		if _, ok := ep.Params[p]; ok {
+			return p
+		}
+	}
+	for k := range ep.Params {
+		return k
+	}
+	return ""
 }
 
 func printUsage() {

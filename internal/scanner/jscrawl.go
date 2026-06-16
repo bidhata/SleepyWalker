@@ -13,8 +13,9 @@ import (
 
 // JSCrawl uses a headless Chrome browser to render the page and extract
 // entry points from JS-rendered content (SPAs, React/Angular apps, etc.).
+// The depth parameter is reserved for future multi-page JS crawling.
 // Returns additional entry points not visible in static HTML.
-func JSCrawl(seedURL string, depth int) ([]EntryPoint, error) {
+func JSCrawl(seedURL string, _ int) ([]EntryPoint, error) {
 	log.Printf("[JS-CRAWL] Rendering %s with headless browser…", seedURL)
 
 	opts := append(chromedp.DefaultExecAllocatorOptions[:],

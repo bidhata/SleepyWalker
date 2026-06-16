@@ -147,7 +147,7 @@ func RunSQLMap(cfg config.Config, ep scanner.EntryPoint, payload string, outputD
 
 	// Fix #12: guard info nil before calling info.IsDir() — walkErr non-nil means info is nil.
 	var dumps []string
-	filepath.Walk(epDir, func(path string, info os.FileInfo, walkErr error) error {
+	if walkErr := filepath.Walk(epDir, func(path string, info os.FileInfo, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
@@ -159,7 +159,9 @@ func RunSQLMap(cfg config.Config, ep scanner.EntryPoint, payload string, outputD
 			dumps = append(dumps, path)
 		}
 		return nil
-	})
+	}); walkErr != nil {
+		return nil, fmt.Errorf("failed to collect dump files from %s: %w", epDir, walkErr)
+	}
 
 	if len(dumps) == 0 {
 		return nil, fmt.Errorf("no dump files produced for %s", targetURL)

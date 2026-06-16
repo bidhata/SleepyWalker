@@ -30,7 +30,11 @@ func CreateTargetDir(targetURL string) string {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		log.Printf("[WARN] Could not create target dir %s: %v", dir, err)
 	}
-	abs, _ := filepath.Abs(dir)
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		log.Printf("[WARN] Could not resolve absolute path for %s: %v", dir, err)
+		return dir // return relative path as fallback
+	}
 	return abs
 }
 

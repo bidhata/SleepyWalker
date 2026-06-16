@@ -28,9 +28,22 @@ func NewRateLimiter(baseDelay time.Duration, maxRequests int) *RateLimiter {
 
 // Wait blocks until the rate limiter allows the next request.
 // Returns false if the max request budget is exhausted.
+// Uses atomic compare-and-swap to prevent TOCTOU over-counting under concurrency.
 func (rl *RateLimiter) Wait() bool {
-	if rl.maxRequests > 0 && rl.reqCount.Load() >= rl.maxRequests {
-		return false
+	if rl.maxRequests > 0 {
+		// Atomically claim a slot: increment only if we're still under the cap.
+		for {
+			current := rl.reqCount.Load()
+			if current >= rl.maxRequests {
+				return false
+			}
+			if rl.reqCount.CompareAndSwap(current, current+1) {
+				break
+			}
+			// Another goroutine incremented concurrently — retry.
+		}
+	} else {
+		rl.reqCount.Add(1)
 	}
 
 	rl.mu.Lock()
@@ -38,7 +51,7 @@ func (rl *RateLimiter) Wait() bool {
 	backoff := rl.backoffUntil
 	rl.mu.Unlock()
 
-	// If in backoff period, wait until it passes
+	// If in backoff period, wait until it passes.
 	if !backoff.IsZero() && time.Now().Before(backoff) {
 		waitDur := time.Until(backoff)
 		log.Printf("[RATE] Backing off for %v", waitDur)
@@ -49,7 +62,6 @@ func (rl *RateLimiter) Wait() bool {
 		time.Sleep(delay)
 	}
 
-	rl.reqCount.Add(1)
 	return true
 }
 

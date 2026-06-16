@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
 	"strings"
 	"time"
 
@@ -92,10 +93,13 @@ func callProvider(cfg config.Config, prompt string) (*AIVerdict, error) {
 		return nil, fmt.Errorf("bedrock provider not yet implemented — use openrouter or offline mode")
 
 	case "local":
-		// Fix #10: use a sensible default model for Ollama-compatible local servers.
-		// gpt-4o-mini is an OpenAI model name that does not exist in Ollama.
 		apiURL = "http://localhost:11434/v1/chat/completions"
-		model = "llama3" // operator can override by setting SLEEPYWALKER_LOCAL_MODEL env var
+		// Model name is configurable via SLEEPYWALKER_LOCAL_MODEL env var.
+		// Defaults to llama3 which ships with most Ollama installations.
+		model = os.Getenv("SLEEPYWALKER_LOCAL_MODEL")
+		if model == "" {
+			model = "llama3"
+		}
 
 	default: // "openrouter"
 		apiURL = "https://openrouter.ai/api/v1/chat/completions"

@@ -4,7 +4,7 @@
 
 ### *The SQL Injection Scanner That Never Sleeps*
 
-**Discover. Confirm. Exploit. Report.**
+**Discover. Confirm. Exploit. Report. Learn.**
 
 [![Go Version](https://img.shields.io/badge/Go-1.23+-00ADD8?style=for-the-badge&logo=go&logoColor=white)](https://golang.org)
 [![License](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)](LICENSE)
@@ -13,12 +13,13 @@
 
 <br>
 
-<img src="https://readme-typing-svg.demolab.com?font=Fira+Code&weight=600&size=22&pause=1000&color=6C5CE7&center=true&vCenter=true&width=600&lines=AI-Powered+SQLi+Detection;10+Deep+Validation+Techniques;Zero+False+Positive+Philosophy;From+Discovery+to+Database+Dump;Built+for+Red+Teams+%F0%9F%94%B4" alt="Typing SVG" />
+<img src="https://readme-typing-svg.demolab.com?font=Fira+Code&weight=600&size=22&pause=1000&color=6C5CE7&center=true&vCenter=true&width=600&lines=AI-Powered+SQLi+Detection;10+Deep+Validation+Techniques;Zero+False+Positive+Philosophy;From+Discovery+to+Database+Dump;Self-Learning+Pattern+Database;Built+for+Red+Teams+%F0%9F%94%B4" alt="Typing SVG" />
 
 <br>
 
 ```
  You give it a URL. It gives you the database.
+ And it gets smarter every time it runs.
 ```
 
 <br>
@@ -27,6 +28,7 @@
 [How It Works](#-how-it-works) •
 [Features](#-features) •
 [Config](#-configuration) •
+[Learning DB](#-learning-database) •
 [Hooks](#-plugin-system)
 
 </div>
@@ -37,27 +39,25 @@
 
 ## 💀 What Is This?
 
-SleepyWalker is a **fully autonomous SQL injection pipeline** that chains crawling, heuristic analysis, AI-powered confirmation, and sqlmap exploitation into a single command.
-
-It's what happens when you give a penetration tester's brain to a Go binary.
+SleepyWalker is a **fully autonomous SQL injection pipeline** that chains crawling, heuristic analysis, AI-powered confirmation, and sqlmap exploitation into a single command — and gets smarter with every scan through a persistent learning database.
 
 ```bash
 sleepywalker -url https://target.internal -operator "you" -engagement-id "PT-2024-042"
 ```
 
-That's it. It crawls. It probes. It thinks. It confirms. It dumps. It reports.
+That's it. It crawls. It probes. It confirms. It dumps. It reports. It **learns**.
 
 <br>
 
 ## ⚡ Quick Start
 
 ```bash
-# Clone & build (10 seconds)
+# Clone & build
 git clone https://github.com/bidhata/SleepyWalker.git
 cd SleepyWalker
 go build -o sleepywalker ./cmd/
 
-# Run your first scan
+# Run your first scan (dry-run = no exploitation)
 ./sleepywalker -url https://target.example.com -dry-run
 ```
 
@@ -73,6 +73,11 @@ go build -o sleepywalker ./cmd/
                     └────────────────────┬────────────────────┘
                                          │
                     ┌────────────────────▼────────────────────┐
+                    │    Learning DB loaded from prior scans   │
+                    │  → enriches payloads & error signatures  │
+                    └────────────────────┬────────────────────┘
+                                         │
+                    ┌────────────────────▼────────────────────┐
                     │         PRE-SCAN: WAF Detection          │
                     │    Fingerprints Cloudflare, AWS WAF,     │
                     │    ModSecurity, Imperva, Akamai...       │
@@ -83,10 +88,11 @@ go build -o sleepywalker ./cmd/
           │                                                              │
           │  🕷️ Recursive HTML Crawl    🌐 JS-Rendered (chromedp)        │
           │  📋 OpenAPI/Swagger Import   📡 Header/JSON/Body injection   │
+          │  🔗 Path segment injection   📎 Multipart forms              │
           │                                                              │
-          │  → Injects 10+ SQLi payloads per entry point                │
-          │  → Matches against 30+ DB error signatures                  │
-          │  → Flags suspicious endpoints                               │
+          │  → Built-in + learned payloads per injection context        │
+          │  → Built-in + learned DB error signatures                   │
+          │  → Phase 1a: error-based  1b: boolean-blind  1c: time-based │
           └──────────────────────────────┬──────────────────────────────┘
                                          │
           ┌──────────────────────────────▼──────────────────────────────┐
@@ -118,7 +124,6 @@ go build -o sleepywalker ./cmd/
           │     → Auto-selects tamper scripts per WAF                   │
           │     → Forwards cookies, headers, proxy                      │
           │     → Configurable --risk and --level                       │
-          │                                                              │
           └───────────────────────────────┬─────────────────────────────┘
                                           │
                     ┌─────────────────────▼─────────────────────┐
@@ -126,9 +131,13 @@ go build -o sleepywalker ./cmd/
                     │                                            │
                     │   HTML   •   JSON   •   SARIF 2.1.0       │
                     │   CWE-89  •  CVSS 9.8  •  Remediation     │
-                    │                                            │
-                    │   → GitHub Code Scanning compatible        │
-                    │   → Jira / Azure DevOps importable         │
+                    └─────────────────────┬─────────────────────┘
+                                          │
+                    ┌─────────────────────▼─────────────────────┐
+                    │         🧠 LEARNING DB UPDATED             │
+                    │  Confirmed payloads scored  •  FPs noted  │
+                    │  Host profiles  •  WAF fingerprints       │
+                    │  Next scan is faster and more accurate    │
                     └───────────────────────────────────────────┘
 ```
 
@@ -142,31 +151,82 @@ go build -o sleepywalker ./cmd/
 |---|:---:|:---:|
 | AI-powered false positive elimination | ✅ | ❌ |
 | 10-technique deep validation (no AI needed) | ✅ | ❌ |
+| Self-learning pattern database | ✅ | ❌ |
 | WAF-aware tamper script auto-selection | ✅ | ❌ |
 | Full audit trail (JSONL) for compliance | ✅ | ❌ |
 | Scope control (regex + CIDR) | ✅ | ❌ |
 | JS-rendered page crawling | ✅ | ❌ |
 | OpenAPI/Swagger endpoint import | ✅ | ❌ |
+| Multipart form + path segment injection | ✅ | ❌ |
 | SARIF output for CI/CD integration | ✅ | ❌ |
-| Plugin/hook system | ✅ | ❌ |
+| Plugin/hook system (5 lifecycle phases) | ✅ | ❌ |
 | Interactive exploitation consent | ✅ | ❌ |
 | Adaptive rate limiting with backoff | ✅ | ❌ |
 | TOML config file support | ✅ | ❌ |
+| MCP server for AI agent integration | ✅ | ❌ |
 | Single binary, zero runtime deps | ✅ | ❌ |
+
+<br>
+
+### 🔍 Injection Coverage
+
+| Location | Methods | Detection |
+|---|---|---|
+| Query parameters | GET, DELETE | Error, Boolean, Time |
+| Form body | POST, PUT, PATCH | Error, Boolean, Time |
+| JSON body | POST, PUT, PATCH | Error, Boolean, Time |
+| HTTP headers | User-Agent, Referer, X-Forwarded-For, Cookie | Error, Boolean, Time |
+| Multipart fields | POST | Error |
+| URL path segments | GET (integers, UUIDs) | Error |
 
 <br>
 
 ### 🛡️ Safety First
 
-This isn't a script kiddie toy. It's built for **authorized red team operations** with guardrails:
+Built for **authorized red team operations** with guardrails:
 
 - **Scope enforcement** — regex and CIDR whitelist; blocks out-of-scope targets at startup
-- **Dry-run mode** — full pipeline minus exploitation; perfect for reporting without risk
+- **Dry-run mode** — full pipeline minus exploitation; perfect for CI/CD gates
 - **Exploitation consent** — interactive `[y/N]` prompt listing every target before Phase 3
 - **Request budget** — hard cap on total HTTP requests to prevent accidental DoS
 - **Adaptive throttling** — auto-backs off on 429/503, exponential backoff with recovery
 - **Graceful shutdown** — Ctrl+C flushes audit logs, no data loss
 - **Full audit trail** — every action logged as JSONL with operator identity
+
+<br>
+
+## 🧠 Learning Database
+
+SleepyWalker maintains a persistent learning database at `~/.sleepywalker/learningdb.json` that gets smarter with every scan.
+
+### What It Learns
+
+| Category | What's Stored | Impact |
+|---|---|---|
+| **Error signatures** | New DB error patterns not in the built-in list | Detected on future scans automatically |
+| **Successful payloads** | Payloads that confirmed SQLi, scored by success rate | Prioritised in future probes |
+| **WAF fingerprints** | WAF header/body patterns seen in the wild | Faster WAF detection |
+| **Host profiles** | Per-host: DB engine, WAF, injectable params | Skip known-clean endpoints on rescan |
+| **False positives** | Host+param combos that fired but weren't injectable | Skipped after 5 false hits |
+
+### How It Enriches Scanning
+
+```
+First scan:   Built-in 10 payloads → 1 confirmed → DB records the winning payload
+Second scan:  11 payloads (built-in + learned) → winning payload tried first
+Tenth scan:   Learned payloads with >80% hit rate sorted to front → faster detection
+```
+
+### Controlling the DB
+
+```bash
+# Use a custom DB path (useful for team-shared DBs)
+sleepywalker -url https://target.internal -ldb-path /shared/team-learningdb.json
+
+# Default path
+~/.sleepywalker/learningdb.json   (Linux/macOS)
+%APPDATA%\.sleepywalker\learningdb.json   (Windows)
+```
 
 <br>
 
@@ -199,9 +259,9 @@ regex = ".*\\.internal$"
 cidrs = ["10.0.0.0/8"]
 
 [scan]
-depth       = 3
-threads     = 8
-delay_ms    = 200
+depth        = 3
+threads      = 8
+delay_ms     = 200
 max_requests = 5000
 
 [auth]
@@ -219,7 +279,8 @@ log_dir       = "./logs"
 [[hooks]]
 name    = "notify-slack"
 phase   = "post-report"
-command = "python3 scripts/notify_slack.py"
+command = "python3"
+args    = "scripts/notify_slack.py"
 timeout = 15
 ```
 
@@ -237,7 +298,7 @@ timeout = 15
 | `-scope-cidr` | | CIDR whitelist (repeatable) |
 | `-dry-run` | `false` | Report without exploitation |
 | `-max-requests` | `0` | Request budget (0 = unlimited) |
-| `-depth` | `2` | Crawl depth (0 = unlimited) |
+| `-depth` | `0` | Crawl depth (0 = unlimited) |
 | `-threads` | `4` | Concurrency |
 | `-delay` | `0` | Request delay (ms) |
 | `-js-render` | `false` | Headless browser crawl |
@@ -255,6 +316,7 @@ timeout = 15
 | `-engagement-id` | | Engagement reference |
 | `-log-dir` | | Audit log directory |
 | `-hooks-dir` | | Hook scripts directory |
+| `-ldb-path` | `~/.sleepywalker/learningdb.json` | Learning DB path |
 
 <br>
 
@@ -298,14 +360,6 @@ Every hook receives full scan context as **JSON on stdin**:
 }
 ```
 
-**Ideas for hooks:**
-- Slack/Teams/Discord notifications
-- Upload reports to S3/GCS
-- Auto-create Jira tickets for findings
-- Validate engagement authorization against internal API
-- Trigger remediation workflows
-- Send metrics to Datadog/Prometheus
-
 <br>
 
 ## 📊 Output Formats
@@ -315,11 +369,6 @@ Every hook receives full scan context as **JSON on stdin**:
 | **HTML** | Human-readable report with dark UI | Email, browser |
 | **JSON** | Machine processing, dashboards | SIEM, custom tooling |
 | **SARIF 2.1.0** | CI/CD security gates | GitHub Code Scanning, Azure DevOps, Jira |
-
-```bash
-# Generate all formats at once
-sleepywalker -url https://target.internal -output-format all
-```
 
 Output lands in `./dumps/<target-host>/`:
 ```
@@ -333,21 +382,47 @@ dumps/target_internal/
 
 <br>
 
+## 🤖 MCP Server
+
+SleepyWalker ships a Model Context Protocol server so AI agents (Claude, Amazon Q, etc.) can invoke scan capabilities as tools.
+
+```bash
+go build -o sleepywalker-mcp ./mcp/
+```
+
+Register in your MCP client config:
+
+```json
+{
+  "mcpServers": {
+    "sleepywalker": {
+      "command": "/path/to/sleepywalker-mcp"
+    }
+  }
+}
+```
+
+**Tools exposed:** `sleepywalker_scan` • `sleepywalker_discover` • `sleepywalker_waf_detect` • `sleepywalker_validate` • `sleepywalker_report`
+
+<br>
+
 ## 🏗️ Architecture
 
 ```
 SleepyWalker/
 ├── cmd/main.go                      # CLI + pipeline orchestration
+├── mcp/main.go                      # MCP server for AI agent integration
 ├── internal/
 │   ├── config/
 │   │   ├── config.go                # Runtime config, scope validation, TLS
 │   │   └── configfile.go            # TOML config loader + CLI merge
 │   ├── hooks/hooks.go               # Plugin/hook lifecycle system
+│   ├── learningdb/db.go             # Persistent learning database
 │   ├── scanner/
 │   │   ├── scanner.go               # Crawl engine (HTML + recursive)
 │   │   ├── jscrawl.go               # Headless browser (chromedp)
 │   │   ├── swagger.go               # OpenAPI/Swagger parser
-│   │   ├── heuristic.go             # Phase 1: payload injection
+│   │   ├── heuristic.go             # Phase 1: payload injection + learning
 │   │   ├── deepvalidate.go          # Phase 2: 10-technique validation
 │   │   └── waf.go                   # WAF fingerprinting
 │   ├── ai/ai.go                     # Phase 2: AI analysis (multi-provider)
@@ -398,13 +473,15 @@ sleepywalker -url https://spa.internal \
   -js-render \
   -swagger-url https://spa.internal/api/docs/openapi.json \
   -output-format all
+
+# Team-shared learning DB
+sleepywalker -url https://target.internal \
+  -ldb-path /team-share/sleepywalker-learningdb.json
 ```
 
 <br>
 
 ## 🤝 Contributing
-
-This is an internal red team tool, but contributions are welcome:
 
 1. Fork it
 2. Create your feature branch (`git checkout -b feat/amazing-feature`)
@@ -416,7 +493,7 @@ This is an internal red team tool, but contributions are welcome:
 - Additional WAF bypass techniques
 - New deep validation heuristics
 - Integration hooks for more platforms
-- Documentation & examples
+- Learning DB export/import tooling
 
 <br>
 
@@ -446,6 +523,6 @@ This is an internal red team tool, but contributions are welcome:
 
 <br>
 
-**Go** • **OpenRouter AI** • **sqlmap** • **chromedp**
+**Go** • **OpenRouter AI** • **sqlmap** • **chromedp** • **MCP**
 
 </div>

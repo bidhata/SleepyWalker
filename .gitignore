@@ -1,0 +1,28 @@
+# Compiled binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+sleepywalker
+sleepywalker-mcp
+cmd.exe
+
+# Output directories
+dumps/
+logs/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test/coverage
+*.test
+*.out
+coverage.html

@@ -1,6 +1,7 @@
 package scanner
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -126,9 +127,9 @@ func deepProbe(client *http.Client, hr HeuristicResult) DeepResult {
 
 	// ── 5. Error consistency testing ────────────────────────────────
 	if ok := errorConsistencyTest(client, ep, param); ok {
-		signals = append(signals, techniqueSignal{"error-consistency", true, 0.10, ""})
+		signals = append(signals, techniqueSignal{"error-consistency", true, 0.20, ""})
 	} else {
-		signals = append(signals, techniqueSignal{"error-consistency", false, 0.10, ""})
+		signals = append(signals, techniqueSignal{"error-consistency", false, 0.20, ""})
 	}
 
 	// ── 6. HTTP status code correlation ─────────────────────────────
@@ -203,20 +204,17 @@ func deepProbe(client *http.Client, hr HeuristicResult) DeepResult {
 type injectionContext string
 
 const (
-	ctxUnknown    injectionContext = "unknown"
-	ctxString     injectionContext = "string-single-quote"
-	ctxStringDbl  injectionContext = "string-double-quote"
-	ctxNumeric    injectionContext = "numeric"
-	ctxInHTML     injectionContext = "html-attribute"
+	ctxUnknown   injectionContext = "unknown"
+	ctxString    injectionContext = "string-single-quote"
+	ctxStringDbl injectionContext = "string-double-quote"
+	ctxNumeric   injectionContext = "numeric"
 )
 
 // detectInjectionContext determines whether the parameter is inside a quoted
 // string, a numeric context, or an HTML attribute by analyzing error responses.
 func detectInjectionContext(client *http.Client, ep EntryPoint, param string) injectionContext {
-	// Send a single-quote probe
 	sqResp := fetchWithPayload(client, ep, param, "1'")
 	dqResp := fetchWithPayload(client, ep, param, "1\"")
-	numResp := fetchWithPayload(client, ep, param, "1 AND 1=1")
 	baseline := fetchWithPayload(client, ep, param, "1")
 
 	if baseline == "" {
@@ -225,11 +223,20 @@ func detectInjectionContext(client *http.Client, ep EntryPoint, param string) in
 
 	sqLower := strings.ToLower(sqResp)
 	dqLower := strings.ToLower(dqResp)
+	baseLower := strings.ToLower(baseline)
 
-	// Check for single-quote error (means we're in a single-quoted string)
-	sqError := containsAny(sqLower, []string{"syntax error", "unterminated", "unclosed quotation", "you have an error"})
-	dqError := containsAny(dqLower, []string{"syntax error", "unterminated", "unclosed quotation", "you have an error"})
+	// SQL syntax error patterns — must appear in the quoted response.
+	syntaxErrors := []string{"syntax error", "unterminated", "unclosed quotation", "you have an error"}
 
+	sqError := containsAny(sqLower, syntaxErrors)
+	dqError := containsAny(dqLower, syntaxErrors)
+
+	// Only count as a real signal if the error is NEW (not already in the baseline).
+	// When the DB table is missing, baseline itself contains a DB error — any additional
+	// error from quoting still changes the response in a meaningful way.
+	baselineHasSyntaxError := containsAny(baseLower, syntaxErrors)
+
+	// Single-quote causes a syntax error that baseline doesn't have → string context.
 	if sqError && !dqError {
 		return ctxString
 	}
@@ -237,11 +244,15 @@ func detectInjectionContext(client *http.Client, ep EntryPoint, param string) in
 		return ctxStringDbl
 	}
 
-	// Check if numeric injection works (different response from baseline without quotes)
-	if numResp != "" && baseline != "" {
-		numSim := jaccardSimilarity(baseline, numResp)
-		if numSim > 0.85 {
-			return ctxNumeric
+	// Numeric check: only valid when baseline is a clean response (no errors).
+	// If baseline already contains DB errors, numSim will be artificially high.
+	if !baselineHasSyntaxError {
+		numResp := fetchWithPayload(client, ep, param, "1 AND 1=1")
+		if numResp != "" {
+			numSim := jaccardSimilarity(baseline, numResp)
+			if numSim > 0.85 {
+				return ctxNumeric
+			}
 		}
 	}
 
@@ -607,11 +618,15 @@ func fetchStatusCode(client *http.Client, ep EntryPoint, param, payload string) 
 	switch ep.Method {
 	case "POST":
 		form := url.Values{}
-		for k := range ep.Params {
+		for k, v := range ep.Params {
 			if k == param {
 				form.Set(k, payload)
 			} else {
-				form.Set(k, "test")
+				neutral := v
+				if neutral == "" {
+					neutral = "1"
+				}
+				form.Set(k, neutral)
 			}
 		}
 		resp, err = client.PostForm(ep.URL, form)
@@ -839,11 +854,15 @@ func secondOrderStub(client *http.Client, ep EntryPoint, param string) bool {
 
 	// Store the marker
 	form := url.Values{}
-	for k := range ep.Params {
+	for k, v := range ep.Params {
 		if k == param {
 			form.Set(k, marker)
 		} else {
-			form.Set(k, "test")
+			neutral := v
+			if neutral == "" {
+				neutral = "test"
+			}
+			form.Set(k, neutral)
 		}
 	}
 
@@ -851,6 +870,8 @@ func secondOrderStub(client *http.Client, ep EntryPoint, param string) bool {
 	if err != nil {
 		return false
 	}
+	// Drain body so the TCP connection is returned to the pool.
+	io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
 
 	// Now fetch the same URL via GET and look for SQL errors
@@ -901,17 +922,22 @@ func pickParam(ep EntryPoint) string {
 }
 
 // buildURL creates the full URL with the given param set to the payload value.
+// Preserves declared param values (e.g. Login=Login, Submit=Submit) as neutrals.
 func buildURL(ep EntryPoint, param, payload string) (string, error) {
 	u, err := url.Parse(ep.URL)
 	if err != nil {
 		return "", err
 	}
 	q := u.Query()
-	for k := range ep.Params {
+	for k, v := range ep.Params {
 		if k == param {
 			q.Set(k, payload)
 		} else {
-			q.Set(k, "1") // neutral value for other params
+			neutral := v
+			if neutral == "" {
+				neutral = "1"
+			}
+			q.Set(k, neutral)
 		}
 	}
 	if _, ok := ep.Params[param]; !ok {
@@ -922,6 +948,8 @@ func buildURL(ep EntryPoint, param, payload string) (string, error) {
 }
 
 // fetchWithPayload sends a request with a single param set to the payload and returns the body.
+// Preserves actual declared param values as neutrals (e.g. Submit=Submit) so
+// server-side isset() checks don't skip the query.
 func fetchWithPayload(client *http.Client, ep EntryPoint, param, payload string) string {
 	var resp *http.Response
 	var err error
@@ -929,11 +957,15 @@ func fetchWithPayload(client *http.Client, ep EntryPoint, param, payload string)
 	switch ep.Method {
 	case "POST":
 		form := url.Values{}
-		for k := range ep.Params {
+		for k, v := range ep.Params {
 			if k == param {
 				form.Set(k, payload)
 			} else {
-				form.Set(k, "test")
+				neutral := v
+				if neutral == "" {
+					neutral = "1"
+				}
+				form.Set(k, neutral)
 			}
 		}
 		resp, err = client.PostForm(ep.URL, form)
@@ -958,27 +990,91 @@ func fetchWithPayload(client *http.Client, ep EntryPoint, param, payload string)
 }
 
 // measureTime sends a request and returns the wall-clock duration.
+// Handles all injection locations: query, body (POST/PUT/PATCH), header, json.
 func measureTime(client *http.Client, ep EntryPoint, param, payload string) time.Duration {
-	u, err := buildURL(ep, param, payload)
-	if err != nil {
-		return -1
-	}
 	start := time.Now()
 	var resp *http.Response
-	switch ep.Method {
-	case "POST":
+	var err error
+
+	switch ep.InjectionLoc {
+	case "header":
+		req, reqErr := http.NewRequest("GET", ep.URL, nil)
+		if reqErr != nil {
+			return -1
+		}
+		req.Header.Set("User-Agent", "SleepyWalker/1.0")
+		req.Header.Set(param, payload)
+		resp, err = client.Do(req)
+
+	case "json":
+		jsonBody := make(map[string]interface{})
+		for k, v := range ep.Params {
+			if k == param {
+				jsonBody[k] = payload
+			} else {
+				if v == "" {
+					v = "1"
+				}
+				jsonBody[k] = v
+			}
+		}
+		b, marshalErr := json.Marshal(jsonBody)
+		if marshalErr != nil {
+			return -1
+		}
+		req, reqErr := http.NewRequest("POST", ep.URL, strings.NewReader(string(b)))
+		if reqErr != nil {
+			return -1
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("User-Agent", "SleepyWalker/1.0")
+		resp, err = client.Do(req)
+
+	case "body", "multipart":
 		form := url.Values{}
-		for k := range ep.Params {
+		for k, v := range ep.Params {
 			if k == param {
 				form.Set(k, payload)
 			} else {
-				form.Set(k, "test")
+				if v == "" {
+					v = "1"
+				}
+				form.Set(k, v)
 			}
 		}
-		resp, err = client.PostForm(ep.URL, form)
-	default:
-		resp, err = client.Get(u)
+		req, reqErr := http.NewRequest(ep.Method, ep.URL, strings.NewReader(form.Encode()))
+		if reqErr != nil {
+			return -1
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("User-Agent", "SleepyWalker/1.0")
+		resp, err = client.Do(req)
+
+	default: // query / GET
+		u, buildErr := buildURL(ep, param, payload)
+		if buildErr != nil {
+			return -1
+		}
+		switch ep.Method {
+		case "POST":
+			form := url.Values{}
+			for k, v := range ep.Params {
+				if k == param {
+					form.Set(k, payload)
+				} else {
+					neutral := v
+					if neutral == "" {
+						neutral = "1"
+					}
+					form.Set(k, neutral)
+				}
+			}
+			resp, err = client.PostForm(ep.URL, form)
+		default:
+			resp, err = client.Get(u)
+		}
 	}
+
 	if err != nil {
 		return -1
 	}

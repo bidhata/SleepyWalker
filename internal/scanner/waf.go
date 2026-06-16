@@ -104,7 +104,10 @@ func DetectWAF(cfg *config.Config, targetURL string) WAFResult {
 	client := cfg.BuildHTTPClient(10 * time.Second)
 
 	// Send a clean request first to get baseline
-	baseReq, _ := http.NewRequest("GET", targetURL, nil)
+	baseReq, err := http.NewRequest("GET", targetURL, nil)
+	if err != nil {
+		return WAFResult{Detected: false}
+	}
 	baseReq.Header.Set("User-Agent", "SleepyWalker/1.0 (Security Scanner)")
 	cfg.ApplyHeaders(baseReq)
 	baseResp, baseErr := client.Do(baseReq)

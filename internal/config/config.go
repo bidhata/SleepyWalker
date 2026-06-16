@@ -11,6 +11,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/term"
@@ -133,12 +134,16 @@ func (c *Config) ValidateScope(targetURL string) error {
 }
 
 // BuildHTTPClient creates an *http.Client pre-configured with proxy and redirect policy.
+// The TLS warning is logged once per process when -insecure is set.
+var insecureWarningOnce sync.Once
+
 func (c *Config) BuildHTTPClient(timeout time.Duration) *http.Client {
 	transport := &http.Transport{}
 
 	if c.Insecure {
-		// Fix #13: log a clear warning when TLS verification is disabled.
-		log.Println("[WARN] TLS certificate verification disabled (-insecure). Do not use on untrusted networks.")
+		insecureWarningOnce.Do(func() {
+			log.Println("[WARN] TLS certificate verification disabled (-insecure). Do not use on untrusted networks.")
+		})
 		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec
 	}
 

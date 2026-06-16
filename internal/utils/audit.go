@@ -69,8 +69,12 @@ func InitAuditLogger(logDir, operator, engagementID, targetURL string) {
 		"tool_version":  "SleepyWalker/2.0",
 	}
 	data, _ := json.Marshal(header)
-	f.Write(data)
-	f.WriteString("\n")
+	if _, err := f.Write(data); err != nil {
+		log.Printf("[AUDIT] Failed to write session header: %v", err)
+		f.Close()
+		return
+	}
+	f.WriteString("\n") //nolint:errcheck
 
 	log.Printf("[AUDIT] Logging to %s", path)
 }
@@ -95,8 +99,11 @@ func AuditLog(entry AuditEntry) {
 
 	globalAudit.eventCount++
 	data, _ := json.Marshal(entry)
-	globalAudit.file.Write(data)
-	globalAudit.file.WriteString("\n")
+	if _, err := globalAudit.file.Write(data); err != nil {
+		log.Printf("[AUDIT] Write failed: %v", err)
+		return
+	}
+	globalAudit.file.WriteString("\n") //nolint:errcheck
 }
 
 // AuditRequestCount returns total audit events recorded this session.
@@ -132,9 +139,9 @@ func CloseAuditLogger() {
 		"duration_sec": time.Since(globalAudit.startTime).Seconds(),
 	}
 	data, _ := json.Marshal(footer)
-	globalAudit.file.Write(data)
-	globalAudit.file.WriteString("\n")
-	globalAudit.file.Close()
+	globalAudit.file.Write(data)         //nolint:errcheck
+	globalAudit.file.WriteString("\n")   //nolint:errcheck
+	globalAudit.file.Close()             //nolint:errcheck
 }
 
 // GetAuditMeta returns operator and engagement info for reports.

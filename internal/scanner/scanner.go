@@ -19,7 +19,8 @@ type EntryPoint struct {
 	Method       string
 	URL          string
 	Params       map[string]string
-	InjectionLoc string // "query", "body", "header", "json"
+	InjectionLoc string // "query", "body", "multipart", "header", "json", "path"
+	PathSegments []string // ordered list of path segments that are numeric/injectable
 }
 
 // CrawlAndDiscover performs recursive crawling from the seed URL up to
@@ -66,7 +67,13 @@ func CrawlAndDiscover(cfg *config.Config, seedURL string) ([]EntryPoint, error) 
 
 		resp, err := client.Do(req)
 		if err != nil {
-			log.Printf("[CRAWL] ✗ Failed to fetch %s: %v", u, err)
+			errMsg := err.Error()
+			if strings.Contains(errMsg, "x509") || strings.Contains(errMsg, "tls") {
+				log.Printf("[CRAWL] ✗ TLS error for %s: %v", u, err)
+				log.Printf("[CRAWL]   Hint: re-run with -insecure to skip certificate verification")
+			} else {
+				log.Printf("[CRAWL] ✗ Failed to fetch %s: %v", u, err)
+			}
 			return
 		}
 		defer resp.Body.Close()
@@ -159,7 +166,22 @@ func CrawlAndDiscover(cfg *config.Config, seedURL string) ([]EntryPoint, error) 
 
 	// Deduplicate
 	allEPs = deduplicateEPs(allEPs)
-	return allEPs, nil
+
+	// Filter to same-host entry points only. The crawler restricts link-following
+	// to seedHost, but extractEntryPoints also creates EPs from external links
+	// (e.g. YouTube video links with query params) found on crawled pages.
+	var sameHostEPs []EntryPoint
+	for _, ep := range allEPs {
+		epParsed, err := url.Parse(ep.URL)
+		if err != nil {
+			continue
+		}
+		// Allow same host, or header EPs (which use the page URL, already same-host).
+		if epParsed.Host == seedHost || ep.InjectionLoc == "header" {
+			sameHostEPs = append(sameHostEPs, ep)
+		}
+	}
+	return sameHostEPs, nil
 }
 
 // extractEntryPoints pulls forms and query-parameterised links from a parsed page.
@@ -181,7 +203,12 @@ func extractEntryPoints(doc *goquery.Document, pageURL string) []EntryPoint {
 		if err != nil {
 			return
 		}
-		fullURL := base.ResolveReference(actionURL).String()
+		// Strip fragment: action="#" is a common pattern meaning "submit to current page".
+		// url.ResolveReference keeps the fragment; HTTP clients strip it, but we
+		// clean it here so probe URLs don't carry a trailing #.
+		resolved := base.ResolveReference(actionURL)
+		resolved.Fragment = ""
+		fullURL := resolved.String()
 
 		params := make(map[string]string)
 		s.Find("input[name], textarea[name], select[name]").Each(func(j int, inp *goquery.Selection) {
@@ -190,9 +217,15 @@ func extractEntryPoints(doc *goquery.Document, pageURL string) []EntryPoint {
 			params[name] = val
 		})
 
+		// Detect enctype to distinguish form-encoded vs multipart.
+		enctype, _ := s.Attr("enctype")
 		loc := "query"
 		if strings.EqualFold(method, "POST") {
-			loc = "body"
+			if strings.Contains(strings.ToLower(enctype), "multipart") {
+				loc = "multipart"
+			} else {
+				loc = "body"
+			}
 		}
 		eps = append(eps, EntryPoint{
 			Method:       strings.ToUpper(method),
@@ -226,9 +259,63 @@ func extractEntryPoints(doc *goquery.Document, pageURL string) []EntryPoint {
 				InjectionLoc: "query",
 			})
 		}
+
+		// Extract path segment entry points (e.g. /api/users/123/orders).
+		if pathEP, ok := extractPathSegmentEP(full); ok {
+			eps = append(eps, pathEP)
+		}
 	})
 
 	return eps
+}
+
+// extractPathSegmentEP returns an EntryPoint for URLs that have numeric or
+// UUID-like path segments that are likely injectable (e.g. /api/users/123).
+func extractPathSegmentEP(u *url.URL) (EntryPoint, bool) {
+	segments := strings.Split(strings.Trim(u.Path, "/"), "/")
+	var injectableSegments []string
+	for _, seg := range segments {
+		if isInjectableSegment(seg) {
+			injectableSegments = append(injectableSegments, seg)
+		}
+	}
+	if len(injectableSegments) == 0 {
+		return EntryPoint{}, false
+	}
+	// Strip fragment, keep query as-is for the base URL.
+	base := *u
+	base.Fragment = ""
+	return EntryPoint{
+		Method:       "GET",
+		URL:          base.String(),
+		Params:       map[string]string{},
+		InjectionLoc: "path",
+		PathSegments: injectableSegments,
+	}, true
+}
+
+// isInjectableSegment returns true for path segments that look like data values
+// rather than route names: pure integers, UUIDs, or short alphanumeric IDs.
+func isInjectableSegment(seg string) bool {
+	if len(seg) == 0 {
+		return false
+	}
+	// Pure integer: /users/123
+	allDigits := true
+	for _, c := range seg {
+		if c < '0' || c > '9' {
+			allDigits = false
+			break
+		}
+	}
+	if allDigits && len(seg) <= 12 {
+		return true
+	}
+	// UUID: /orders/550e8400-e29b-41d4-a716-446655440000
+	if len(seg) == 36 && strings.Count(seg, "-") == 4 {
+		return true
+	}
+	return false
 }
 
 // buildHeaderEntryPoints creates synthetic entry points for header-based injection.
