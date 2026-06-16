@@ -104,8 +104,8 @@ func CrawlAndDiscover(cfg *config.Config, seedURL string) ([]EntryPoint, error) 
 		allEPs = append(allEPs, jsonEPs...)
 		mu.Unlock()
 
-		// If we haven't reached max depth, follow same-host links
-		if level < depth {
+		// Follow same-host links: depth=0 means unlimited, otherwise stop at depth.
+		if depth == 0 || level < depth {
 			doc.Find("a[href]").Each(func(i int, s *goquery.Selection) {
 				href, _ := s.Attr("href")
 				child, err := url.Parse(href)
