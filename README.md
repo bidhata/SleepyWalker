@@ -237,7 +237,7 @@ timeout = 15
 | `-scope-cidr` | | CIDR whitelist (repeatable) |
 | `-dry-run` | `false` | Report without exploitation |
 | `-max-requests` | `0` | Request budget (0 = unlimited) |
-| `-depth` | `0` | Crawl depth |
+| `-depth` | `2` | Crawl depth (0 = unlimited) |
 | `-threads` | `4` | Concurrency |
 | `-delay` | `0` | Request delay (ms) |
 | `-js-render` | `false` | Headless browser crawl |

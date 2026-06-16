@@ -47,7 +47,7 @@ func main() {
 		proxyURL     string
 		headers      []string
 		threads      = 4
-		crawlDepth   = 0
+		crawlDepth   = 2
 		rateDelayMs  = 0
 		maxRequests  = 0
 		dryRun       = false
@@ -719,7 +719,7 @@ Scope & Safety:
   -max-requests <N>        Maximum total HTTP requests (0 = unlimited)
 
 Scanning:
-  -depth <N>               Recursive crawl depth (default: 0 = single page)
+  -depth <N>               Recursive crawl depth (default: 2; 0 = unlimited)
   -threads <N>             Concurrent scan threads (default: 4)
   -delay <ms>              Base delay between requests in ms (default: 0)
   -js-render               Enable headless browser for JS-rendered pages
