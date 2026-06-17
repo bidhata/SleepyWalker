@@ -367,6 +367,8 @@ func main() {
 		if ldb != nil {
 			ldb.RecordWAF(extractURLHost(targetURL), wafResult.WAFName, "", "", wafResult.Fingerprint)
 		}
+		// Profile individual blocked tokens for smarter tamper selection.
+		scanner.ProfileWAFTokens(cfg, targetURL, &wafResult)
 	}
 
 	// ══════════════════════════════════════════════════════════════════
@@ -442,7 +444,7 @@ func main() {
 	if offlineMode {
 		log.Printf("  PHASE 2 ▸ Deep local validation on %d suspicious endpoint(s)", len(suspicious))
 
-		deepResults := scanner.DeepValidate(suspicious)
+		deepResults := scanner.DeepValidate(cfg, suspicious)
 		for i, dr := range deepResults {
 			if dr.Confirmed {
 				confirmed = append(confirmed, confirmedEntry{

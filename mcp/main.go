@@ -399,7 +399,7 @@ func execValidate(args map[string]interface{}) ToolResult {
 		return toolText(string(data))
 	}
 
-	deepResults := scanner.DeepValidate(suspicious)
+	deepResults := scanner.DeepValidate(cfg, suspicious)
 	if len(deepResults) == 0 {
 		return toolText(`{"confirmed": false, "message": "Deep validation returned no results"}`)
 	}

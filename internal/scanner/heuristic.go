@@ -75,6 +75,7 @@ var sqlErrorSignatures = []struct {
 }
 
 // testPayloads are classic probe strings injected into parameter values.
+// Organized by detection category for context-aware prioritization.
 var testPayloads = []string{
 	"'",
 	"\"",
@@ -86,6 +87,50 @@ var testPayloads = []string{
 	"1; SELECT 1--",
 	"' UNION SELECT NULL--",
 	"1' AND 1=CONVERT(int,(SELECT @@version))--",
+}
+
+// contextPriorityPayloads returns payloads reordered for the detected context.
+// String-context payloads come first for string contexts, numeric for numeric.
+func contextPriorityPayloads(base []string, ctx string) []string {
+	switch ctx {
+	case "header":
+		// Header context: prefer string-quoted payloads.
+		priority := []string{
+			"Mozilla/5.0' AND '1'='1'-- -",
+			"test' OR '1'='1'-- -",
+			"'",
+		}
+		return prependUnique(priority, base)
+	case "json":
+		// JSON bodies: prefer string-quoted payloads.
+		priority := []string{
+			"'",
+			"1' OR '1'='1",
+			"\" OR \"1\"=\"1",
+		}
+		return prependUnique(priority, base)
+	default:
+		return base
+	}
+}
+
+// prependUnique prepends priority payloads to base, skipping duplicates.
+func prependUnique(priority, base []string) []string {
+	seen := make(map[string]bool)
+	var out []string
+	for _, p := range priority {
+		if !seen[p] {
+			seen[p] = true
+			out = append(out, p)
+		}
+	}
+	for _, p := range base {
+		if !seen[p] {
+			seen[p] = true
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // effectiveSignatures returns the built-in SQL error signatures merged with
@@ -195,7 +240,8 @@ func probeEntryPoint(client *http.Client, cfg *config.Config, ep EntryPoint, rl 
 	}
 
 	// ── Phase 1a: error signature matching ──────────────────────────
-	payloads := effectivePayloads(ep.InjectionLoc)
+	rawPayloads := effectivePayloads(ep.InjectionLoc)
+	payloads := contextPriorityPayloads(rawPayloads, ep.InjectionLoc)
 	for _, payload := range payloads {
 		if !rl.Wait() {
 			log.Printf("[HEURISTIC] Request budget exhausted, stopping probes for %s", ep.URL)
@@ -324,8 +370,8 @@ func blindPreScreen(client *http.Client, cfg *config.Config, ep EntryPoint) bool
 					break
 				}
 
-				trueSim := jaccardSimilarity(baseline, trueBody)
-				falseSim := jaccardSimilarity(baseline, falseBody)
+				trueSim := htmlStripJaccard(baseline, trueBody)
+				falseSim := htmlStripJaccard(baseline, falseBody)
 
 				if trueSim > 0.85 {
 					trueSimilarCount++
@@ -348,21 +394,37 @@ func blindPreScreen(client *http.Client, cfg *config.Config, ep EntryPoint) bool
 // fetchParamWithPayload sends a request injecting payload into a specific parameter only,
 // using the correct method and content-type for the entry point.
 func fetchParamWithPayload(client *http.Client, cfg *config.Config, ep EntryPoint, targetKey, payload string) string {
+	body, _, _ := fetchParamWithPayloadWithStatus(client, cfg, ep, targetKey, payload)
+	return body
+}
+
+// fetchParamWithPayloadWithStatus sends a request injecting payload into a specific parameter only,
+// using the correct method and content-type for the entry point, and returns body, status code, and error.
+// Supports GET, POST, PUT, PATCH, DELETE, header, json, body, multipart, and path injection.
+func fetchParamWithPayloadWithStatus(client *http.Client, cfg *config.Config, ep EntryPoint, targetKey, payload string) (string, int, error) {
+	var req *http.Request
+	var err error
+
+	method := ep.Method
+	if method == "" {
+		if ep.InjectionLoc == "json" || ep.InjectionLoc == "body" || ep.InjectionLoc == "multipart" {
+			method = "POST"
+		} else {
+			method = "GET"
+		}
+	}
+
 	switch ep.InjectionLoc {
 	case "header":
-		req, err := http.NewRequest("GET", ep.URL, nil)
+		req, err = http.NewRequest(method, ep.URL, nil)
 		if err != nil {
-			return ""
+			return "", 0, err
 		}
 		req.Header.Set("User-Agent", "SleepyWalker/1.0")
-		cfg.ApplyHeaders(req)
-		// Inject payload into the target header; leave all other headers at their cfg values.
-		req.Header.Set(targetKey, payload)
-		body, _, err := doRequestWithStatus(client, req)
-		if err != nil {
-			return ""
+		if cfg != nil {
+			cfg.ApplyHeaders(req)
 		}
-		return body
+		req.Header.Set(targetKey, payload)
 
 	case "json":
 		jsonBody := make(map[string]interface{})
@@ -379,20 +441,17 @@ func fetchParamWithPayload(client *http.Client, cfg *config.Config, ep EntryPoin
 		}
 		b, err := json.Marshal(jsonBody)
 		if err != nil {
-			return ""
+			return "", 0, err
 		}
-		req, err := http.NewRequest("POST", ep.URL, bytes.NewReader(b))
+		req, err = http.NewRequest(method, ep.URL, bytes.NewReader(b))
 		if err != nil {
-			return ""
+			return "", 0, err
 		}
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("User-Agent", "SleepyWalker/1.0")
-		cfg.ApplyHeaders(req)
-		body, _, err := doRequestWithStatus(client, req)
-		if err != nil {
-			return ""
+		if cfg != nil {
+			cfg.ApplyHeaders(req)
 		}
-		return body
 
 	case "body", "multipart":
 		form := url.Values{}
@@ -407,23 +466,58 @@ func fetchParamWithPayload(client *http.Client, cfg *config.Config, ep EntryPoin
 				form.Set(k, neutral)
 			}
 		}
-		req, err := http.NewRequest(ep.Method, ep.URL, strings.NewReader(form.Encode()))
+		req, err = http.NewRequest(method, ep.URL, strings.NewReader(form.Encode()))
 		if err != nil {
-			return ""
+			return "", 0, err
 		}
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		req.Header.Set("User-Agent", "SleepyWalker/1.0")
-		cfg.ApplyHeaders(req)
-		body, _, err := doRequestWithStatus(client, req)
-		if err != nil {
-			return ""
+		if cfg != nil {
+			cfg.ApplyHeaders(req)
 		}
-		return body
+
+	case "path":
+		injectURL := ep.URL
+		if len(ep.PathSegments) > 0 {
+			targetSeg := targetKey
+			found := false
+			for _, seg := range ep.PathSegments {
+				if seg == targetKey {
+					targetSeg = seg
+					found = true
+					break
+				}
+			}
+			if !found {
+				targetSeg = ep.PathSegments[0]
+			}
+			injectURL = strings.Replace(ep.URL, "/"+targetSeg, "/"+url.PathEscape(payload), 1)
+		} else {
+			u, parseErr := url.Parse(ep.URL)
+			if parseErr == nil {
+				path := u.Path
+				if path != "" && path != "/" {
+					lastSlash := strings.LastIndex(path, "/")
+					if lastSlash >= 0 {
+						u.Path = path[:lastSlash+1] + url.PathEscape(payload)
+						injectURL = u.String()
+					}
+				}
+			}
+		}
+		req, err = http.NewRequest(method, injectURL, nil)
+		if err != nil {
+			return "", 0, err
+		}
+		req.Header.Set("User-Agent", "SleepyWalker/1.0")
+		if cfg != nil {
+			cfg.ApplyHeaders(req)
+		}
 
 	default: // query
 		u, err := url.Parse(ep.URL)
 		if err != nil {
-			return ""
+			return "", 0, err
 		}
 		q := u.Query()
 		for k, v := range ep.Params {
@@ -438,18 +532,17 @@ func fetchParamWithPayload(client *http.Client, cfg *config.Config, ep EntryPoin
 			}
 		}
 		u.RawQuery = q.Encode()
-		req, err := http.NewRequest(ep.Method, u.String(), nil)
+		req, err = http.NewRequest(method, u.String(), nil)
 		if err != nil {
-			return ""
+			return "", 0, err
 		}
 		req.Header.Set("User-Agent", "SleepyWalker/1.0")
-		cfg.ApplyHeaders(req)
-		body, _, err := doRequestWithStatus(client, req)
-		if err != nil {
-			return ""
+		if cfg != nil {
+			cfg.ApplyHeaders(req)
 		}
-		return body
 	}
+
+	return doRequestWithStatus(client, req)
 }
 
 // sendProbeRequestWithStatus dispatches the request and returns body, HTTP status, and error.
@@ -753,7 +846,7 @@ func sendPathProbeWithStatus(client *http.Client, cfg *config.Config, ep EntryPo
 }
 
 // timePreScreen does a fast single-round timing check.
-// Only tries MySQL SLEEP (the most common DB) to keep the check fast.
+// Tests MySQL, PostgreSQL, MSSQL, and SQLite time-delay payloads.
 // Tests only the first likely-injectable parameter to avoid N×4 requests per endpoint.
 func timePreScreen(client *http.Client, cfg *config.Config, ep EntryPoint) bool {
 	timeClient := &http.Client{
@@ -778,10 +871,19 @@ func timePreScreen(client *http.Client, cfg *config.Config, ep EntryPoint) bool 
 		neutralVal = "1"
 	}
 
-	// Try both numeric and string-quoted MySQL SLEEP variants.
+	// Multi-DB sleep payloads: MySQL, PostgreSQL, MSSQL, SQLite.
 	sleepPayloads := []string{
+		// MySQL (numeric and string-quoted)
 		"1 AND SLEEP(3)-- -",
 		"1' AND SLEEP(3)-- -",
+		// PostgreSQL
+		"1; SELECT pg_sleep(3)-- -",
+		"1'; SELECT pg_sleep(3)-- -",
+		// MSSQL
+		"1; WAITFOR DELAY '0:0:3'-- -",
+		"1'; WAITFOR DELAY '0:0:3'-- -",
+		// SQLite (heavy computation as time proxy)
+		"1' AND 1=LIKE('ABCDEFG',UPPER(HEX(RANDOMBLOB(100000000/2))))-- -",
 	}
 
 	baseStart := time.Now()

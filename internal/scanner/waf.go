@@ -5,6 +5,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -13,10 +14,11 @@ import (
 
 // WAFResult holds WAF detection findings.
 type WAFResult struct {
-	Detected    bool
-	WAFName     string
-	Fingerprint string
-	Bypass      []string // suggested bypass techniques
+	Detected      bool
+	WAFName       string
+	Fingerprint   string
+	Bypass        []string // suggested bypass techniques
+	BlockedTokens []string // individual SQL tokens/chars the WAF blocks
 }
 
 // wafSignature maps response characteristics to known WAF products.
@@ -198,4 +200,74 @@ func DetectWAF(cfg *config.Config, targetURL string) WAFResult {
 
 	log.Println("[WAF] ✓ No WAF detected")
 	return WAFResult{Detected: false}
+}
+
+// ProfileWAFTokens sends individual SQL characters/keywords as separate requests
+// to determine exactly which tokens are blocked by the WAF. This enables
+// smarter tamper script selection and payload construction.
+func ProfileWAFTokens(cfg *config.Config, targetURL string, waf *WAFResult) {
+	if !waf.Detected {
+		return
+	}
+
+	client := cfg.BuildHTTPClient(10 * time.Second)
+
+	// Get baseline status for the clean URL.
+	baseReq, err := http.NewRequest("GET", targetURL, nil)
+	if err != nil {
+		return
+	}
+	baseReq.Header.Set("User-Agent", "SleepyWalker/1.0 (Security Scanner)")
+	cfg.ApplyHeaders(baseReq)
+	baseResp, err := client.Do(baseReq)
+	if err != nil {
+		return
+	}
+	io.Copy(io.Discard, baseResp.Body)
+	baseResp.Body.Close()
+	baseStatus := baseResp.StatusCode
+
+	// Tokens to probe individually.
+	tokens := []string{
+		"'", `"`, "--", "/*", "*/", "#",
+		"UNION", "SELECT", "INSERT", "UPDATE", "DELETE",
+		"DROP", "OR", "AND", "SLEEP", "WAITFOR",
+		"BENCHMARK", "pg_sleep", "LOAD_FILE", "INTO OUTFILE",
+		"xp_cmdshell", "INFORMATION_SCHEMA",
+	}
+
+	var blocked []string
+	sep := "?"
+	if strings.Contains(targetURL, "?") {
+		sep = "&"
+	}
+
+	for _, token := range tokens {
+		testURL := fmt.Sprintf("%s%ssw_waf_test=%s", targetURL, sep, url.QueryEscape(token))
+		req, err := http.NewRequest("GET", testURL, nil)
+		if err != nil {
+			continue
+		}
+		req.Header.Set("User-Agent", "SleepyWalker/1.0 (Security Scanner)")
+		cfg.ApplyHeaders(req)
+
+		resp, err := client.Do(req)
+		if err != nil {
+			continue
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+
+		// A token is "blocked" if the WAF returns 403/406/429 while baseline was OK.
+		if baseStatus < 400 && (resp.StatusCode == 403 || resp.StatusCode == 406 || resp.StatusCode == 429) {
+			blocked = append(blocked, token)
+		}
+	}
+
+	waf.BlockedTokens = blocked
+	if len(blocked) > 0 {
+		log.Printf("[WAF] 🔍 Blocked tokens: %s", strings.Join(blocked, ", "))
+	} else {
+		log.Println("[WAF] 🔍 No individual tokens blocked (WAF may use pattern-based rules)")
+	}
 }

@@ -13,7 +13,7 @@
 
 <br>
 
-<img src="https://readme-typing-svg.demolab.com?font=Fira+Code&weight=600&size=22&pause=1000&color=6C5CE7&center=true&vCenter=true&width=600&lines=AI-Powered+SQLi+Detection;10+Deep+Validation+Techniques;Zero+False+Positive+Philosophy;From+Discovery+to+Database+Dump;Self-Learning+Pattern+Database;Built+for+Red+Teams+%F0%9F%94%B4" alt="Typing SVG" />
+<img src="https://readme-typing-svg.demolab.com?font=Fira+Code&weight=600&size=22&pause=1000&color=6C5CE7&center=true&vCenter=true&width=600&lines=AI-Powered+SQLi+Detection;11+Deep+Validation+Techniques;Zero+False+Positive+Philosophy;From+Discovery+to+Database+Dump;Self-Learning+Pattern+Database;Built+for+Red+Teams+%F0%9F%94%B4" alt="Typing SVG" />
 
 <br>
 
@@ -102,21 +102,21 @@ go build -o sleepywalker ./cmd/
           │     → Structured JSON verdict with confidence score          │
           │     → Retry with exponential backoff                         │
           │                                                              │
-          │  🔬 Offline Deep Validation (10 techniques)                  │
+          │  🔬 Offline Deep Validation (11 techniques)                  │
           │     → Boolean-blind (Jaccard similarity)                     │
           │     → Time-blind (multi-round statistical median)            │
           │     → Error-based, UNION-based, DB-specific probes           │
           │     → Content-length delta, status correlation               │
-          │     → Second-order detection                                 │
+          │     → Second-order, Out-of-band DNS resolution              │
           │                                                              │
           │  Composite weighted confidence score → 0.0 – 1.0            │
           └──────────────────────────────┬──────────────────────────────┘
                                          │
-                              ┌───────────▼───────────┐
-                              │   OPERATOR CONFIRMS   │
-                              │     [y/N] prompt      │
-                              └───────────┬───────────┘
-                                          │
+                               ┌───────────▼───────────┐
+                               │   OPERATOR CONFIRMS   │
+                               │     [y/N] prompt      │
+                               └───────────┬───────────┘
+                                           │
           ┌───────────────────────────────▼─────────────────────────────┐
           │                  PHASE 3: Exploitation                       │
           │                                                              │
@@ -141,7 +141,6 @@ go build -o sleepywalker ./cmd/
                     └───────────────────────────────────────────┘
 ```
 
-<br>
 
 ## 🔥 Features
 
@@ -150,7 +149,7 @@ go build -o sleepywalker ./cmd/
 | Feature | SleepyWalker | Basic Scanners |
 |---|:---:|:---:|
 | AI-powered false positive elimination | ✅ | ❌ |
-| 10-technique deep validation (no AI needed) | ✅ | ❌ |
+| 11-technique deep validation (no AI needed) | ✅ | ❌ |
 | Self-learning pattern database | ✅ | ❌ |
 | WAF-aware tamper script auto-selection | ✅ | ❌ |
 | Full audit trail (JSONL) for compliance | ✅ | ❌ |

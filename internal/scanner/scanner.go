@@ -140,6 +140,17 @@ func CrawlAndDiscover(cfg *config.Config, seedURL string) ([]EntryPoint, error) 
 
 	crawl(seedURL, 0)
 
+	// ── Hidden resource discovery (robots.txt, sitemap.xml) ───────────
+	robotsEPs := discoverFromRobots(client, seedParsed, visited, crawl, depth)
+	mu.Lock()
+	allEPs = append(allEPs, robotsEPs...)
+	mu.Unlock()
+
+	sitemapEPs := discoverFromSitemap(client, seedParsed, visited, crawl, depth)
+	mu.Lock()
+	allEPs = append(allEPs, sitemapEPs...)
+	mu.Unlock()
+
 	// ── JS-rendered crawl (optional) ─────────────────────────────────
 	if cfg.JSRender {
 		jsEPs, err := JSCrawl(seedURL, depth)
@@ -163,6 +174,12 @@ func CrawlAndDiscover(cfg *config.Config, seedURL string) ([]EntryPoint, error) 
 			mu.Unlock()
 		}
 	}
+
+	// ── Parameter fuzzing for pages with no listed params ────────────
+	fuzzEPs := parameterFuzz(client, cfg, seedParsed, visited)
+	mu.Lock()
+	allEPs = append(allEPs, fuzzEPs...)
+	mu.Unlock()
 
 	// Deduplicate
 	allEPs = deduplicateEPs(allEPs)
@@ -410,4 +427,247 @@ func deduplicateEPs(eps []EntryPoint) []EntryPoint {
 func DiscoverEntryPoints(target string) ([]EntryPoint, error) {
 	cfg := &config.Config{CrawlDepth: 0}
 	return CrawlAndDiscover(cfg, target)
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Hidden Resource Discovery
+// ═══════════════════════════════════════════════════════════════════════
+
+// discoverFromRobots fetches /robots.txt and extracts Disallow/Allow paths,
+// feeding them back into the crawl queue to discover otherwise-hidden pages.
+func discoverFromRobots(client *http.Client, seed *url.URL, visited *sync.Map, crawl func(string, int), depth int) []EntryPoint {
+	robotsURL := fmt.Sprintf("%s://%s/robots.txt", seed.Scheme, seed.Host)
+
+	resp, err := client.Get(robotsURL)
+	if err != nil || resp.StatusCode != 200 {
+		if resp != nil {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
+		return nil
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	if err != nil {
+		return nil
+	}
+
+	var eps []EntryPoint
+	lines := strings.Split(string(body), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		var path string
+		if strings.HasPrefix(strings.ToLower(line), "disallow:") {
+			path = strings.TrimSpace(line[len("disallow:"):])
+		} else if strings.HasPrefix(strings.ToLower(line), "allow:") {
+			path = strings.TrimSpace(line[len("allow:"):])
+		} else if strings.HasPrefix(strings.ToLower(line), "sitemap:") {
+			// Sitemap directives in robots.txt are handled by discoverFromSitemap.
+			continue
+		} else {
+			continue
+		}
+		if path == "" || path == "/" || strings.Contains(path, "*") {
+			continue
+		}
+
+		fullURL := fmt.Sprintf("%s://%s%s", seed.Scheme, seed.Host, path)
+		// Feed into the existing crawl queue.
+		crawl(fullURL, 1)
+		log.Printf("[CRAWL] robots.txt → discovered %s", fullURL)
+
+		// If the path has query params, create an entry point.
+		parsed, err := url.Parse(fullURL)
+		if err == nil && parsed.RawQuery != "" {
+			qMap := make(map[string]string)
+			for key, vals := range parsed.Query() {
+				v := ""
+				if len(vals) > 0 {
+					v = vals[0]
+				}
+				qMap[key] = v
+			}
+			eps = append(eps, EntryPoint{
+				Method:       "GET",
+				URL:          fullURL,
+				Params:       qMap,
+				InjectionLoc: "query",
+			})
+		}
+	}
+
+	if len(eps) > 0 {
+		log.Printf("[CRAWL] robots.txt: found %d entry point(s)", len(eps))
+	}
+	return eps
+}
+
+// discoverFromSitemap fetches /sitemap.xml and extracts <loc> URLs,
+// feeding them into the crawl queue.
+func discoverFromSitemap(client *http.Client, seed *url.URL, visited *sync.Map, crawl func(string, int), depth int) []EntryPoint {
+	sitemapURL := fmt.Sprintf("%s://%s/sitemap.xml", seed.Scheme, seed.Host)
+
+	resp, err := client.Get(sitemapURL)
+	if err != nil || resp.StatusCode != 200 {
+		if resp != nil {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
+		return nil
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 512*1024))
+	if err != nil {
+		return nil
+	}
+
+	// Simple <loc>...</loc> extraction without a full XML parser.
+	content := string(body)
+	var eps []EntryPoint
+	count := 0
+	for {
+		start := strings.Index(content, "<loc>")
+		if start < 0 {
+			break
+		}
+		content = content[start+5:]
+		end := strings.Index(content, "</loc>")
+		if end < 0 {
+			break
+		}
+		locURL := strings.TrimSpace(content[:end])
+		content = content[end+6:]
+
+		if locURL == "" {
+			continue
+		}
+
+		// Only follow same-host URLs.
+		parsed, err := url.Parse(locURL)
+		if err != nil || parsed.Host != seed.Host {
+			continue
+		}
+
+		// Feed into the crawl queue.
+		crawl(locURL, 1)
+		count++
+
+		// Create entry point if it has query params.
+		if parsed.RawQuery != "" {
+			qMap := make(map[string]string)
+			for key, vals := range parsed.Query() {
+				v := ""
+				if len(vals) > 0 {
+					v = vals[0]
+				}
+				qMap[key] = v
+			}
+			eps = append(eps, EntryPoint{
+				Method:       "GET",
+				URL:          locURL,
+				Params:       qMap,
+				InjectionLoc: "query",
+			})
+		}
+	}
+
+	if count > 0 {
+		log.Printf("[CRAWL] sitemap.xml: discovered %d URL(s), %d entry point(s)", count, len(eps))
+	}
+	return eps
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Parameter Fuzzing
+// ═══════════════════════════════════════════════════════════════════════
+
+// parameterFuzz tries common parameter names against pages that were crawled
+// but had no query parameters. If adding a parameter changes the response
+// (status != 404, body length differs), it is treated as an implicit parameter.
+func parameterFuzz(client *http.Client, cfg *config.Config, seed *url.URL, visited *sync.Map) []EntryPoint {
+	commonParams := []string{"id", "page", "search", "q", "query", "user", "cat", "item", "file", "debug", "action", "type", "sort", "order", "limit", "offset", "uuid"}
+
+	var eps []EntryPoint
+	var fuzzedURLs []string
+
+	visited.Range(func(key, value interface{}) bool {
+		rawURL, ok := key.(string)
+		if !ok {
+			return true
+		}
+		parsed, err := url.Parse(rawURL)
+		if err != nil || parsed.Host != seed.Host {
+			return true
+		}
+		// Only fuzz pages with no existing query params.
+		if parsed.RawQuery != "" {
+			return true
+		}
+		// Only fuzz up to 20 pages to keep request count manageable.
+		if len(fuzzedURLs) >= 20 {
+			return false
+		}
+		fuzzedURLs = append(fuzzedURLs, rawURL)
+		return true
+	})
+
+	for _, rawURL := range fuzzedURLs {
+		// Get baseline response length.
+		baseReq, err := http.NewRequest("GET", rawURL, nil)
+		if err != nil {
+			continue
+		}
+		baseReq.Header.Set("User-Agent", "SleepyWalker/1.0")
+		if cfg != nil {
+			cfg.ApplyHeaders(baseReq)
+		}
+		baseResp, err := client.Do(baseReq)
+		if err != nil {
+			continue
+		}
+		baseBody, _ := io.ReadAll(io.LimitReader(baseResp.Body, 256*1024))
+		baseResp.Body.Close()
+		baseLen := len(baseBody)
+
+		for _, param := range commonParams {
+			testURL := rawURL + "?" + param + "=1"
+			req, err := http.NewRequest("GET", testURL, nil)
+			if err != nil {
+				continue
+			}
+			req.Header.Set("User-Agent", "SleepyWalker/1.0")
+			if cfg != nil {
+				cfg.ApplyHeaders(req)
+			}
+			resp, err := client.Do(req)
+			if err != nil {
+				continue
+			}
+			testBody, _ := io.ReadAll(io.LimitReader(resp.Body, 256*1024))
+			resp.Body.Close()
+
+			// The param is "live" if the response is not 404 and its
+			// length differs meaningfully from the baseline.
+			if resp.StatusCode != 404 && resp.StatusCode < 500 {
+				lenDiff := len(testBody) - baseLen
+				if lenDiff < 0 {
+					lenDiff = -lenDiff
+				}
+				if lenDiff > 10 || resp.StatusCode != baseResp.StatusCode {
+					eps = append(eps, EntryPoint{
+						Method:       "GET",
+						URL:          rawURL,
+						Params:       map[string]string{param: "1"},
+						InjectionLoc: "query",
+					})
+					log.Printf("[FUZZ] Discovered implicit param: %s?%s=1 (Δlen=%d)", rawURL, param, lenDiff)
+				}
+			}
+		}
+	}
+
+	if len(eps) > 0 {
+		log.Printf("[FUZZ] Parameter fuzzing: discovered %d implicit parameter(s)", len(eps))
+	}
+	return eps
 }
