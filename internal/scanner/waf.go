@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"sleepywalker/internal/config"
+	"sleepywalker/internal/utils"
 )
 
 // WAFResult holds WAF detection findings.
@@ -65,7 +66,7 @@ var wafSignatures = []wafSignature{
 		Name:          "Akamai",
 		HeaderKey:     "Server",
 		HeaderPattern: "akamaighost",
-		BodyPattern:   "access denied",
+		BodyPattern:   "",
 		Bypasses:      []string{"tab characters between keywords", "URL encoding", "case alternation"},
 	},
 	{
@@ -205,7 +206,7 @@ func DetectWAF(cfg *config.Config, targetURL string) WAFResult {
 // ProfileWAFTokens sends individual SQL characters/keywords as separate requests
 // to determine exactly which tokens are blocked by the WAF. This enables
 // smarter tamper script selection and payload construction.
-func ProfileWAFTokens(cfg *config.Config, targetURL string, waf *WAFResult) {
+func ProfileWAFTokens(cfg *config.Config, targetURL string, waf *WAFResult, rl *utils.RateLimiter) {
 	if !waf.Detected {
 		return
 	}
@@ -243,6 +244,9 @@ func ProfileWAFTokens(cfg *config.Config, targetURL string, waf *WAFResult) {
 	}
 
 	for _, token := range tokens {
+		if rl != nil {
+			rl.Wait()
+		}
 		testURL := fmt.Sprintf("%s%ssw_waf_test=%s", targetURL, sep, url.QueryEscape(token))
 		req, err := http.NewRequest("GET", testURL, nil)
 		if err != nil {

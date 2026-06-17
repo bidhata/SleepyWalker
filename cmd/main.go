@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -100,7 +101,9 @@ func main() {
 			}
 		case "-threads":
 			if v, ok := nextArg(); ok {
-				fmt.Sscanf(v, "%d", &threads)
+				if n, _ := fmt.Sscanf(v, "%d", &threads); n == 0 {
+					log.Printf("[WARN] Invalid -threads value %q, using default %d", v, threads)
+				}
 				ov.Threads = true
 			}
 		case "-sqlmap-path":
@@ -303,11 +306,15 @@ func main() {
 
 	// Load learning DB — enriches signatures and payloads from prior scans.
 	ldb := learningdb.Load(ldbPath)
-	defer func() {
-		if err := ldb.Save(); err != nil {
-			log.Printf("[WARN] Learning DB save failed: %v", err)
-		}
-	}()
+	var saveOnce sync.Once
+	saveLDB := func() {
+		saveOnce.Do(func() {
+			if err := ldb.Save(); err != nil {
+				log.Printf("[WARN] Learning DB save failed: %v", err)
+			}
+		})
+	}
+	defer saveLDB()
 	log.Printf("[LEARNINGDB] Stats: %s", ldb.Stats())
 
 	// Graceful shutdown: flush audit log on interrupt
@@ -319,9 +326,7 @@ func main() {
 		log.Println("\n[INFO] Interrupt received — shutting down gracefully…")
 		utils.AuditLog(utils.AuditEntry{Action: "interrupted", Detail: "operator signal"})
 		utils.CloseAuditLogger()
-		if err := ldb.Save(); err != nil {
-			log.Printf("[WARN] Learning DB save failed on interrupt: %v", err)
-		}
+		saveLDB()
 		cancel()
 		os.Exit(130)
 	}()
@@ -368,7 +373,7 @@ func main() {
 			ldb.RecordWAF(extractURLHost(targetURL), wafResult.WAFName, "", "", wafResult.Fingerprint)
 		}
 		// Profile individual blocked tokens for smarter tamper selection.
-		scanner.ProfileWAFTokens(cfg, targetURL, &wafResult)
+		scanner.ProfileWAFTokens(cfg, targetURL, &wafResult, rateLimiter)
 	}
 
 	// ══════════════════════════════════════════════════════════════════
@@ -411,7 +416,7 @@ func main() {
 		return
 	}
 
-	heuristicResults := scanner.HeuristicScan(cfg, eps)
+	heuristicResults := scanner.HeuristicScan(cfg, eps, wafResult.BlockedTokens)
 
 	var suspicious []scanner.HeuristicResult
 	for _, hr := range heuristicResults {
@@ -444,7 +449,7 @@ func main() {
 	if offlineMode {
 		log.Printf("  PHASE 2 ▸ Deep local validation on %d suspicious endpoint(s)", len(suspicious))
 
-		deepResults := scanner.DeepValidate(cfg, suspicious)
+		deepResults := scanner.DeepValidate(ctx, cfg, suspicious, rateLimiter)
 		for i, dr := range deepResults {
 			if dr.Confirmed {
 				confirmed = append(confirmed, confirmedEntry{
@@ -742,12 +747,18 @@ func writeReports(cfg *config.Config, targetURL string, results []reporter.ScanR
 	case "all":
 		if p, err := reporter.GenerateHTMLReport(targetURL, results, outputDir); err == nil {
 			paths = append(paths, p)
+		} else {
+			log.Printf("[WARN] HTML report failed: %v", err)
 		}
 		if p, err := reporter.GenerateJSONReport(targetURL, results, outputDir); err == nil {
 			paths = append(paths, p)
+		} else {
+			log.Printf("[WARN] JSON report failed: %v", err)
 		}
 		if p, err := reporter.GenerateSARIFReport(targetURL, results, outputDir); err == nil {
 			paths = append(paths, p)
+		} else {
+			log.Printf("[WARN] SARIF report failed: %v", err)
 		}
 	default:
 		p, err := reporter.GenerateHTMLReport(targetURL, results, outputDir)

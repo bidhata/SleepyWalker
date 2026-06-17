@@ -53,7 +53,7 @@ func InitAuditLogger(logDir, operator, engagementID, targetURL string) {
 		return
 	}
 
-	globalAudit = &AuditLogger{
+	al := &AuditLogger{
 		file:      f,
 		startTime: time.Now(),
 		operator:  operator,
@@ -75,6 +75,9 @@ func InitAuditLogger(logDir, operator, engagementID, targetURL string) {
 		return
 	}
 	f.WriteString("\n") //nolint:errcheck
+
+	// Fix #5: only set globalAudit after header write succeeds.
+	globalAudit = al
 
 	log.Printf("[AUDIT] Logging to %s", path)
 }

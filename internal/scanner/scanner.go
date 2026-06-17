@@ -43,24 +43,32 @@ func CrawlAndDiscover(cfg *config.Config, seedURL string) ([]EntryPoint, error) 
 	}
 	seedHost := seedParsed.Host
 
-	var crawl func(u string, level int)
-	crawl = func(u string, level int) {
-		// Normalise
-		u = strings.TrimRight(u, "#")
+	// Iterative BFS crawl with hard max depth cap to prevent stack overflow.
+	const hardMaxDepth = 100
+	type crawlItem struct {
+		url   string
+		level int
+	}
+	queue := []crawlItem{{seedURL, 0}}
+
+	for len(queue) > 0 {
+		item := queue[0]
+		queue = queue[1:]
+
+		u := strings.TrimRight(item.url, "#")
 		if _, loaded := visited.LoadOrStore(u, true); loaded {
-			return
+			continue
 		}
 
-		log.Printf("[CRAWL] depth=%d  %s", level, u)
+		log.Printf("[CRAWL] depth=%d  %s", item.level, u)
 
-		// Rate limiting
 		if cfg.RateDelay > 0 {
 			time.Sleep(cfg.RateDelay)
 		}
 
 		req, err := http.NewRequest("GET", u, nil)
 		if err != nil {
-			return
+			continue
 		}
 		req.Header.Set("User-Agent", "SleepyWalker/1.0 (Security Scanner)")
 		cfg.ApplyHeaders(req)
@@ -74,36 +82,29 @@ func CrawlAndDiscover(cfg *config.Config, seedURL string) ([]EntryPoint, error) 
 			} else {
 				log.Printf("[CRAWL] ✗ Failed to fetch %s: %v", u, err)
 			}
-			return
+			continue
 		}
-		defer resp.Body.Close()
 
-		// Only parse HTML — drain and discard non-HTML bodies so TCP connections
-		// are returned to the pool (fix #11: missing body drain before Close).
 		ct := resp.Header.Get("Content-Type")
 		if !strings.Contains(ct, "text/html") && !strings.Contains(ct, "application/xhtml") && ct != "" {
 			io.Copy(io.Discard, resp.Body)
-			return
+			resp.Body.Close()
+			continue
 		}
 
 		bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024))
+		resp.Body.Close()
 		if err != nil {
-			return
-		}
-		bodyStr := string(bodyBytes)
-
-		doc, err := goquery.NewDocumentFromReader(strings.NewReader(bodyStr))
-		if err != nil {
-			return
+			continue
 		}
 
-		// Extract entry points from this page
+		doc, err := goquery.NewDocumentFromReader(strings.NewReader(string(bodyBytes)))
+		if err != nil {
+			continue
+		}
+
 		eps := extractEntryPoints(doc, u)
-
-		// Also create header injection entry points for this page
 		headerEPs := buildHeaderEntryPoints(u)
-
-		// Also detect JSON/API endpoints from page
 		jsonEPs := detectJSONEndpoints(doc, u)
 
 		mu.Lock()
@@ -112,8 +113,12 @@ func CrawlAndDiscover(cfg *config.Config, seedURL string) ([]EntryPoint, error) 
 		allEPs = append(allEPs, jsonEPs...)
 		mu.Unlock()
 
-		// Follow same-host links: depth=0 means unlimited, otherwise stop at depth.
-		if depth == 0 || level < depth {
+		// Enqueue child links if within depth limit.
+		maxLevel := depth
+		if depth == 0 {
+			maxLevel = hardMaxDepth
+		}
+		if item.level < maxLevel {
 			doc.Find("a[href]").Each(func(i int, s *goquery.Selection) {
 				href, _ := s.Attr("href")
 				child, err := url.Parse(href)
@@ -122,31 +127,25 @@ func CrawlAndDiscover(cfg *config.Config, seedURL string) ([]EntryPoint, error) 
 				}
 				base, _ := url.Parse(u)
 				full := base.ResolveReference(child)
-
-				// Stay on the same host
 				if full.Host != seedHost {
 					return
 				}
-				// Only follow http/https
 				if full.Scheme != "http" && full.Scheme != "https" {
 					return
 				}
-				// Strip fragment
 				full.Fragment = ""
-				crawl(full.String(), level+1)
+				queue = append(queue, crawlItem{full.String(), item.level + 1})
 			})
 		}
 	}
 
-	crawl(seedURL, 0)
-
 	// ── Hidden resource discovery (robots.txt, sitemap.xml) ───────────
-	robotsEPs := discoverFromRobots(client, seedParsed, visited, crawl, depth)
+	robotsEPs := discoverFromRobots(client, seedParsed, visited)
 	mu.Lock()
 	allEPs = append(allEPs, robotsEPs...)
 	mu.Unlock()
 
-	sitemapEPs := discoverFromSitemap(client, seedParsed, visited, crawl, depth)
+	sitemapEPs := discoverFromSitemap(client, seedParsed, visited)
 	mu.Lock()
 	allEPs = append(allEPs, sitemapEPs...)
 	mu.Unlock()
@@ -332,6 +331,19 @@ func isInjectableSegment(seg string) bool {
 	if len(seg) == 36 && strings.Count(seg, "-") == 4 {
 		return true
 	}
+	// Hex ID: /items/5f3a2b (common in MongoDB/API apps)
+	if len(seg) >= 6 && len(seg) <= 24 {
+		allHex := true
+		for _, c := range seg {
+			if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+				allHex = false
+				break
+			}
+		}
+		if allHex {
+			return true
+		}
+	}
 	return false
 }
 
@@ -360,7 +372,7 @@ func detectJSONEndpoints(doc *goquery.Document, pageURL string) []EntryPoint {
 		text := s.Text()
 		// Simple pattern matching for fetch/axios/XMLHttpRequest URLs
 		patterns := []string{
-			`fetch("`, `fetch('`,
+			`fetch("`, `fetch('`, "fetch(`",
 			`axios.post("`, `axios.post('`,
 			`axios.get("`, `axios.get('`,
 			`.open("POST","`, `.open("GET","`,
@@ -378,6 +390,8 @@ func detectJSONEndpoints(doc *goquery.Document, pageURL string) []EntryPoint {
 			endChar := byte('"')
 			if strings.HasSuffix(pat, "'") {
 				endChar = '\''
+			} else if strings.HasSuffix(pat, "`") {
+				endChar = '`'
 			}
 			endIdx := strings.IndexByte(rest, endChar)
 			if endIdx <= 0 || endIdx > 500 {
@@ -435,7 +449,7 @@ func DiscoverEntryPoints(target string) ([]EntryPoint, error) {
 
 // discoverFromRobots fetches /robots.txt and extracts Disallow/Allow paths,
 // feeding them back into the crawl queue to discover otherwise-hidden pages.
-func discoverFromRobots(client *http.Client, seed *url.URL, visited *sync.Map, crawl func(string, int), depth int) []EntryPoint {
+func discoverFromRobots(client *http.Client, seed *url.URL, visited *sync.Map) []EntryPoint {
 	robotsURL := fmt.Sprintf("%s://%s/robots.txt", seed.Scheme, seed.Host)
 
 	resp, err := client.Get(robotsURL)
@@ -472,8 +486,8 @@ func discoverFromRobots(client *http.Client, seed *url.URL, visited *sync.Map, c
 		}
 
 		fullURL := fmt.Sprintf("%s://%s%s", seed.Scheme, seed.Host, path)
-		// Feed into the existing crawl queue.
-		crawl(fullURL, 1)
+		// Mark as visited so main BFS doesn't re-crawl.
+		visited.LoadOrStore(fullURL, true)
 		log.Printf("[CRAWL] robots.txt → discovered %s", fullURL)
 
 		// If the path has query params, create an entry point.
@@ -504,7 +518,7 @@ func discoverFromRobots(client *http.Client, seed *url.URL, visited *sync.Map, c
 
 // discoverFromSitemap fetches /sitemap.xml and extracts <loc> URLs,
 // feeding them into the crawl queue.
-func discoverFromSitemap(client *http.Client, seed *url.URL, visited *sync.Map, crawl func(string, int), depth int) []EntryPoint {
+func discoverFromSitemap(client *http.Client, seed *url.URL, visited *sync.Map) []EntryPoint {
 	sitemapURL := fmt.Sprintf("%s://%s/sitemap.xml", seed.Scheme, seed.Host)
 
 	resp, err := client.Get(sitemapURL)
@@ -548,8 +562,8 @@ func discoverFromSitemap(client *http.Client, seed *url.URL, visited *sync.Map, 
 			continue
 		}
 
-		// Feed into the crawl queue.
-		crawl(locURL, 1)
+		// Mark as visited.
+		visited.LoadOrStore(locURL, true)
 		count++
 
 		// Create entry point if it has query params.

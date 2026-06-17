@@ -193,6 +193,10 @@ func (db *DB) Save() error {
 	if err := os.WriteFile(tmp, data, 0600); err != nil {
 		return err
 	}
+	// Fix: on Windows os.Rename fails if target exists. Remove first.
+	if runtime.GOOS == "windows" {
+		os.Remove(db.path)
+	}
 	if err := os.Rename(tmp, db.path); err != nil {
 		os.Remove(tmp) // clean up temp file on rename failure
 		return err
@@ -324,9 +328,11 @@ func (db *DB) RecordErrorSignature(engine, pattern string) {
 		FirstSeen: now,
 		LastSeen:  now,
 	})
-	// Cap to prevent unbounded growth.
+	// Fix: sort by hit count before truncating to evict lowest-value entries.
 	if len(db.data.ErrorSignatures) > maxErrorSignatures {
-		// Drop lowest hit-count entry (last after sort-by-hitcount in ErrorSignatures()).
+		sort.Slice(db.data.ErrorSignatures, func(i, j int) bool {
+			return db.data.ErrorSignatures[i].HitCount > db.data.ErrorSignatures[j].HitCount
+		})
 		db.data.ErrorSignatures = db.data.ErrorSignatures[:maxErrorSignatures]
 	}
 }

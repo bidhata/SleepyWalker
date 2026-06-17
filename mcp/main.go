@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -282,7 +283,9 @@ func execScan(args map[string]interface{}) ToolResult {
 	// Fix #3: support OPENROUTER_API_KEY env var so MCP callers can pass a key
 	// without triggering the interactive terminal prompt.
 	exe := findSleepyWalker()
-	cmd := exec.Command(exe, cliArgs...)
+	scanCtx, scanCancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	defer scanCancel()
+	cmd := exec.CommandContext(scanCtx, exe, cliArgs...)
 	cmd.Env = os.Environ() // inherit env, including OPENROUTER_API_KEY if set
 	cmd.Stdin = strings.NewReader("\n")
 
@@ -381,7 +384,7 @@ func execValidate(args map[string]interface{}) ToolResult {
 	}
 
 	cfg := &config.Config{Threads: 1, RateDelay: 200 * time.Millisecond}
-	hResults := scanner.HeuristicScan(cfg, []scanner.EntryPoint{ep})
+	hResults := scanner.HeuristicScan(cfg, []scanner.EntryPoint{ep}, nil)
 
 	var suspicious []scanner.HeuristicResult
 	for _, hr := range hResults {
@@ -399,7 +402,7 @@ func execValidate(args map[string]interface{}) ToolResult {
 		return toolText(string(data))
 	}
 
-	deepResults := scanner.DeepValidate(cfg, suspicious)
+	deepResults := scanner.DeepValidate(context.Background(), cfg, suspicious, nil)
 	if len(deepResults) == 0 {
 		return toolText(`{"confirmed": false, "message": "Deep validation returned no results"}`)
 	}
